@@ -803,13 +803,8 @@ Given a civil servant role profile, classify the designation into one of two gro
 Reason step-by-step using the designation name, responsibilities, and activities before giving your answer.
 Return ONLY a JSON object: {"group": "AB"} or {"group": "CD"}. No markdown."""
 
-COURSE_SELECTION_SYSTEM_PROMPT = """You are a senior Learning & Development advisor for government civil servants.
-Your task: evaluate EVERY candidate course listed and decide "selected" (best 20-25 for the role) or "discarded".
-Return one verdict object per candidate course — do not omit any candidate.
-
-## User Seniority Context
-The user is a **{user_seniority_tier}** officer.
-Competency mix target: {mix_rule}
+COURSE_SELECTION_SYSTEM_PROMPT_OLD = f"""You are a senior Learning & Development advisor for government civil servants.
+Your task: from the candidate courses provided, select the best 50-60 courses for the given role profile.
 
 ## Selection Rules
 1. Provider Priority: Prefer courses from the user's own organisation (Own Org: YES) — they get priority among selected.

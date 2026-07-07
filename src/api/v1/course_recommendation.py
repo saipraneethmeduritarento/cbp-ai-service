@@ -1,7 +1,6 @@
 import asyncio
 import json
 import os
-import re
 import uuid
 from typing import Any, Dict, List
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Path, Query, status
@@ -11,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from google import genai
 from google.genai import types
 
-from ...prompts.prompts import COURSE_SELECTION_SYSTEM_PROMPT, DESIGNNATION_GROUP_SYSTEM_PROMPT, VECTOR_QUERY_SYSTEM_PROMPT, SENIORITY_GROUP_SYSTEM_PROMPT
+from ...prompts.prompts import COURSE_SELECTION_SYSTEM_PROMPT, DESIGNNATION_GROUP_SYSTEM_PROMPT, VECTOR_QUERY_SYSTEM_PROMPT
 
 from ...models.course_recommendation import RecommendationStatus
 from ...models.user import User
@@ -34,12 +33,14 @@ os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = settings.GOOGLE_APPLICATION_CREDE
 client = genai.Client(
     project=settings.GOOGLE_PROJECT_ID,
     location=settings.GOOOGLE_PROJECT_LOCATION_GLOBAL,
-    vertexai=settings.GOOGLE_GENAI_USE_VERTEXAI
+    vertexai=settings.GOOGLE_GENAI_USE_VERTEXAI,
+    http_options=settings.GEMINI_HTTP_OPTIONS
 )
 
 embedding_client = genai.Client(
     api_key=settings.GOOGLE_API_KEY,
-    vertexai=False
+    vertexai=False,
+    http_options=settings.GEMINI_HTTP_OPTIONS
 )
 
 # Curse Recommendation APIs
@@ -62,7 +63,7 @@ async def get_embedding(text: str) -> list:
         
         return response.embeddings
     except Exception as e:
-        print(f"Error generating embedding for text '{text[:50]}...': {e}")
+        logger.exception(f"Error generating embedding for text '{text[:50]}...': {e}")
         return []
 
 async def generate_contextual_queries(user_profile: str) -> Dict[str, Any]:
@@ -111,35 +112,16 @@ async def generate_contextual_queries(user_profile: str) -> Dict[str, Any]:
     )
     logger.info("Contextual queries generated successfully")
     if not response.text:
-        print(response.text)
+        logger.error(f"LLM returned empty response for contextual queries: {response}")
         raise Exception("generate_contextual_queries: LLM returned empty response")
     return json.loads(response.text)
 
-async def infer_designation_group(user_profile: str) -> dict:
+async def infer_designation_group(user_profile: str) -> str:
     """
-    Classify the designation into Group (AB/CD) and seniority tier using the same
-    5-tier taxonomy used by the course seniority tagger.
-    Returns dict with 'group' and 'seniority_tier'.
+    Ask the LLM to reason about the full role profile and classify the designation
+    into Group A/B (senior/gazetted officers) or Group C/D (supporting/clerical staff).
+    Returns 'AB' or 'CD'.
     """
-    system_instruction = """You are an expert in Indian government service classification rules.
-Given a civil servant role profile, classify the designation into:
-
-1. group — one of:
-   - AB: Group A or Group B — gazetted/senior officers, policymakers, managers, specialists
-         (IAS, IPS, directors, deputy secretaries, section officers, engineers, doctors, scientists, etc.)
-   - CD: Group C or Group D — supporting/clerical/operational staff
-         (clerks, assistants, stenographers, drivers, MTS, helpers, data entry operators, technicians, constables, peons, etc.)
-
-2. seniority_tier — one of these exact values:
-   - "Entry Level"       → Probationers, LDCs, newly recruited staff, 0–3 yrs experience
-   - "Junior Officer"    → Section Officers, Inspectors, field operational officers, 3–8 yrs
-   - "Mid-Level Officer" → Under Secretary, Deputy Secretary, Director, 8–15 yrs
-   - "Senior Officer"    → Joint Secretary, Additional Secretary, 15–25 yrs
-   - "Apex / Leadership" → Secretary, DG, HoD, Cabinet Secretary, 25+ yrs
-
-Use the designation name, responsibilities, and activities to reason before classifying.
-Return ONLY a JSON object with both fields. No markdown."""
-
     user_part = types.Part.from_text(text=f"Role Profile:\n{user_profile}")
 
     config = types.GenerateContentConfig(
@@ -154,17 +136,8 @@ Return ONLY a JSON object with both fields. No markdown."""
         response_mime_type="application/json",
         response_schema={
             "type": "OBJECT",
-            "properties": {
-                "group": {
-                    "type": "STRING",
-                    "enum": ["AB", "CD"]
-                },
-                "seniority_tier": {
-                    "type": "STRING",
-                    "enum": ["Entry Level", "Junior Officer", "Mid-Level Officer", "Senior Officer", "Apex / Leadership"]
-                },
-            },
-            "required": ["group", "seniority_tier"],
+            "properties": {"group": {"type": "STRING", "enum": ["AB", "CD"]}},
+            "required": ["group"],
         },
         system_instruction=[types.Part.from_text(text=DESIGNNATION_GROUP_SYSTEM_PROMPT)],
     )
@@ -176,84 +149,38 @@ Return ONLY a JSON object with both fields. No markdown."""
             config=config,
         )
         if not response.text:
-            logger.warning("Designation group LLM returned empty response, defaulting to AB/Mid-Level Officer")
-            return {"group": "AB", "seniority_tier": "Mid-Level Officer"}
+            logger.warning("Designation group LLM returned empty response, defaulting to AB")
+            return "AB"
         result = json.loads(response.text)
-        logger.info(f"LLM classified designation — group: {result.get('group')} | seniority: {result.get('seniority_tier')}")
-        return result
+        group = result.get("group", "AB")
+        logger.info(f"LLM classified designation group as: {group}")
+        return group
     except Exception as e:
-        logger.warning(f"Designation group inference failed, defaulting to AB/Mid-Level Officer: {e}")
-        return {"group": "AB", "seniority_tier": "Mid-Level Officer"}
-
-async def infer_seniority_tier(user_profile: str) -> str:
-    """
-    Classify the designation's seniority tier using the same 5-tier taxonomy
-    used by the course seniority tagger. Returns the seniority tier string.
-    """
-
-    user_part = types.Part.from_text(text=f"Role Profile:\n{user_profile}")
-
-    config = types.GenerateContentConfig(
-        temperature=0,
-        max_output_tokens=256,
-        safety_settings=[
-            types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="OFF"),
-            types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="OFF"),
-            types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="OFF"),
-            types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="OFF"),
-        ],
-        response_mime_type="application/json",
-        response_schema={
-            "type": "OBJECT",
-            "properties": {
-                "seniority_tier": {
-                    "type": "STRING",
-                    "enum": ["Entry Level", "Junior Officer", "Mid-Level Officer", "Senior Officer", "Apex / Leadership"]
-                },
-            },
-            "required": ["seniority_tier"],
-        },
-        system_instruction=[types.Part.from_text(text=SENIORITY_GROUP_SYSTEM_PROMPT)],
-    )
-
-    try:
-        response = await client.aio.models.generate_content(
-            model="gemini-3.5-flash",
-            contents=[types.Content(role="user", parts=[user_part])],
-            config=config,
-        )
-        if not response.text:
-            logger.warning("Seniority tier LLM returned empty response, defaulting to Mid-Level Officer")
-            return "Mid-Level Officer"
-        result = json.loads(response.text)
-        seniority_tier = result.get("seniority_tier", "Mid-Level Officer")
-        logger.info(f"LLM classified seniority: {seniority_tier}")
-        return seniority_tier
-    except Exception as e:
-        logger.warning(f"Seniority tier inference failed, defaulting to Mid-Level Officer: {e}")
-        return "Mid-Level Officer"
+        logger.warning(f"Designation group inference failed, defaulting to AB: {e}")
+        return "AB"
 
 
 async def get_filtered_courses_by_llm(
     courses_prompt: str,
     user_profile: str,
     organisation: str,
-    user_seniority_tier: str = "Mid-Level Officer",
+    designation_group: str,
 ) -> str:
     """
     LLM-based course selection and scoring with:
     - Provider priority (own-org courses preferred)
-    - Domain-mix enforcement
+    - Domain-mix enforcement by designation group
     - Sector-specific domain inclusion
     - Topic/type diversity within domain courses
-    - Seniority-gated filtering using the same framework as the course tagger
-
-    Returns a verdict for EVERY candidate course (selected or discarded, with a reason)
-    so the decision is auditable per-course instead of only returning the winners.
     """
-    logger.info(f"Filtering courses by LLM — seniority: {user_seniority_tier}")
+    logger.info("Filtering candidate courses through LLM")
 
-    mix_rule = "Domain: ~45%, Behavioral: ~27%, Functional: ~28%"
+    if designation_group == "AB":
+        mix_rule = "Domain: ≥50%, Behavioral: ~25%, Functional: ~25%"
+    else:
+        mix_rule = "Domain: ~40%, Behavioral: ~30%, Functional: ~30%"
+    # ({mix_rule})
+    
 
     user_part = types.Part.from_text(text=f"""
 Role Profile:
@@ -273,20 +200,9 @@ Candidate Courses:
                 "identifier":        {"type": "STRING"},
                 "course":            {"type": "STRING"},
                 "relevancy":         {"type": "INTEGER"},
-                "competency_type":   {"type": "STRING", "description": "Domain | Behavioral | Functional"},
                 "rationale":         {"type": "STRING"},
-                "seniority_tier":    {"type": "STRING", "description": "Tier/tier-range the course targets"},
-                "seniority_match":   {"type": "BOOLEAN"},
-                "decision":          {"type": "STRING", "enum": ["selected", "discarded"]},
-                "discard_reason":    {
-                    "type": "STRING",
-                    "enum": ["none", "low_relevancy", "seniority_mismatch", "domain_mix_cap", "other"],
-                },
             },
-            "required": [
-                "identifier", "relevancy", "competency_type", "seniority_tier",
-                "seniority_match", "decision", "discard_reason",
-            ],
+            "required": ["identifier", "course", "relevancy", "rationale"],
         },
     }
 
@@ -311,8 +227,6 @@ Candidate Courses:
         contents=[types.Content(role="user", parts=[user_part])],
         config=config,
     )
-    logger.info("LLM filtering completed")
-
     if not response.text:
         logger.error(f"LLM filtering empty response — failed to inspect:  {response}")
         return "[]"
@@ -453,13 +367,13 @@ async def process_recommendation_task(
       7. LLM selects final courses with domain-mix + provider priority rules
       8. Enrich selected courses and persist
     """
-    logger.info(f"Background task started for recommendation_id: {recommendation_id}")
+    logger.info(f"Starting course recommendation background task for {recommendation_id}")
 
     try:
         # 1. Verify record exists
         rec_record = await crud_recommended_course.get_by_id(recommendation_id)
         if not rec_record:
-            logger.error(f"Record {recommendation_id} not found in background task")
+            logger.error(f"Recommendation record not found for ID: {recommendation_id}. Aborting task.")
             return
 
         # 2. Generate 3 contextual queries + domain search keywords (single LLM call)
@@ -468,7 +382,6 @@ async def process_recommendation_task(
         description_query = queries.get("description_query", "")
         combined_query    = queries.get("combined_query", "")
         search_keywords   = queries.get("search_keywords", [])
-        logger.info(f"Queries generated — keyword: {keyword_query[:60]}... | pg_keywords: {search_keywords}")
         
         all_queries = [{
             "keyword_query": keyword_query,
@@ -568,24 +481,7 @@ async def process_recommendation_task(
             else:
                 org_info = str(_org_raw) if _org_raw else ""
 
-            # comp_names = ""
-            # competencies_info = getattr(meta, "competencies_v6", None)
-            # if competencies_info:
-            #     try:
-            #         comp_list = competencies_info if isinstance(competencies_info, list) else []
-            #         areas = list({e.get("competencyAreaName", "") for e in comp_list if e.get("competencyAreaName")})
-            #         if areas:
-            #             comp_names = f"Competency Areas: {', '.join(areas[:5])}"
-            #     except Exception:
-            #         pass
-
             is_own_org = "YES" if (organisation and org_info and organisation.lower() in org_info.lower()) else "NO"
-
-            desc_raw  = getattr(meta, "description", None) if meta else None
-            desc_info = str(desc_raw).strip()[:500] if desc_raw else ""
-
-            instr_raw  = getattr(meta, "instructions", None) if meta else None
-            instr_info = re.sub(r'<[^>]+>', ' ', str(instr_raw)).strip()[:400] if instr_raw else ""
 
             candidate_lines.append(
                 f"Course ID: {c['identifier']} | "
@@ -600,40 +496,17 @@ async def process_recommendation_task(
 
         courses_prompt = "\n".join(candidate_lines)
 
-        # 8. Determine seniority tier (LLM-reasoned, same taxonomy as course tagger)
-        user_seniority_tier = await infer_seniority_tier(user_profile)
-        logger.info(f"Designation classified — seniority: {user_seniority_tier}")
+        # 8. Determine designation group for mix ratios (LLM-reasoned)
+        # designation_group = await infer_designation_group(user_profile)
+        designation_group = None
 
         # 9. LLM filtering + general courses (parallel)
         filtered_courses_json, general_courses = await asyncio.gather(
-            get_filtered_courses_by_llm(courses_prompt, user_profile, organisation, user_seniority_tier),
+            get_filtered_courses_by_llm(courses_prompt, user_profile, organisation, designation_group),
             get_general_courses_from_gemini(user_profile),
         )
 
-        # LLM now returns a verdict for every candidate (selected or discarded + reason),
-        # not just the winners — needed to audit seniority filtering per course.
-        id_to_name = {c["identifier"]: c["name"] for c in all_candidates}
-        all_verdicts = json.loads(filtered_courses_json)
-        for v in all_verdicts:
-            v["course"] = id_to_name.get(v.get("identifier"), "")
-
-        filtered_courses = [v for v in all_verdicts if v.get("decision") == "selected"]
-        llm_filtered_snapshot = [
-            {
-                "identifier": c.get("identifier"),
-                "name": c.get("course"),
-                "relevancy": c.get("relevancy"),
-                "competency_type": c.get("competency_type"),
-                "seniority_tier": c.get("seniority_tier"),
-            }
-            for c in filtered_courses
-        ]
-
-        discard_reason_counts: Dict[str, int] = {}
-        for v in all_verdicts:
-            if v.get("decision") == "discarded":
-                reason = v.get("discard_reason") or "other"
-                discard_reason_counts[reason] = discard_reason_counts.get(reason, 0) + 1
+        filtered_courses = json.loads(filtered_courses_json)
 
         # 10. Enrich filtered courses with full metadata
         filtered_identifiers = [c["identifier"] for c in filtered_courses]
@@ -644,92 +517,27 @@ async def process_recommendation_task(
         else:
             enriched_map = {}
 
+        
+        filtered_courses = [course for course in filtered_courses if course["identifier"] in enriched_map]
+
         for course in filtered_courses:
             course["is_public"] = False
             meta = enriched_map.get(course["identifier"])
             if meta:
+                course["course"] = meta.name
                 course["competencies"] = meta.competencies_v6
                 course["duration"] = meta.duration
                 _org = meta.organisation
                 course["organisation"] = (
                     ", ".join(str(o) for o in _org if o) if isinstance(_org, list) else (_org or None)
                 )
-            else:
-                course["competencies"] = None
-                course["duration"] = None
-                course["organisation"] = None
 
         final_filtered_courses = filtered_courses + general_courses
-
-        # Trace: dump course names/identifiers at every pipeline layer for debugging
-        try:
-            trace = {
-                "recommendation_id": str(recommendation_id),
-                "designation_name": designation_name,
-                "organisation": organisation,
-                "user_seniority_tier": user_seniority_tier,
-                "queries": all_queries[0],
-                "layers": {
-                    "1_vector_search": [
-                        {"identifier": identifier, "name": name, "score": float(score)}
-                        for identifier, name, score in vector_results
-                    ],
-                    "2_keyword_search": [
-                        {"identifier": identifier, "name": name, "score": float(score)}
-                        for identifier, name, score in kw_results
-                    ],
-                    "3_merged_candidates": [
-                        {"identifier": c["identifier"], "name": c["name"], "score": c["distance"]}
-                        for c in all_candidates
-                    ],
-                    "4_llm_filtered_igot": llm_filtered_snapshot,
-                    "5_general_public": [
-                        {
-                            "identifier": c.get("identifier"),
-                            "name": c.get("course"),
-                            "relevancy": c.get("relevancy"),
-                            "platform": c.get("platform"),
-                        }
-                        for c in general_courses
-                    ],
-                    "6_final_combined": [
-                        {"identifier": c.get("identifier"), "name": c.get("course"), "is_public": c.get("is_public")}
-                        for c in final_filtered_courses
-                    ],
-                },
-                "counts": {
-                    "vector_search": len(vector_results),
-                    "keyword_search": len(kw_results),
-                    "merged_candidates": len(all_candidates),
-                    "llm_filtered_igot": len(llm_filtered_snapshot),
-                    "general_public": len(general_courses),
-                    "final_combined": len(final_filtered_courses),
-                },
-                # Per-course seniority verdicts for every candidate (selected + discarded),
-                # so seniority-driven drops are auditable instead of inferred.
-                "seniority_analysis": {
-                    "user_seniority_tier": user_seniority_tier,
-                    "discarded_total": len(all_verdicts) - len(filtered_courses),
-                    "discard_reason_counts": discard_reason_counts,
-                    "courses": [
-                        {
-                            "identifier": v.get("identifier"),
-                            "name": v.get("course"),
-                            "seniority_tier": v.get("seniority_tier"),
-                            "seniority_match": v.get("seniority_match"),
-                            "decision": v.get("decision"),
-                            "discard_reason": v.get("discard_reason"),
-                        }
-                        for v in all_verdicts
-                    ],
-                },
-            }
-            trace_dir = "logs/course_recommendation_trace"
-            os.makedirs(trace_dir, exist_ok=True)
-            with open(os.path.join(trace_dir, f"{recommendation_id}.json"), "w") as f:
-                json.dump(trace, f, indent=2, ensure_ascii=False, default=str)
-        except Exception:
-            logger.warning(f"Failed to write course recommendation trace for {recommendation_id}", exc_info=True)
+        final_filtered_courses = [
+            course for course in final_filtered_courses
+            if course.get("relevancy", 0) >= settings.COURSE_RECOMMENDATION_MIN_RELEVANCY
+        ]
+        final_filtered_courses.sort(key=lambda course: course.get("relevancy", 0), reverse=True)
 
         # 11. Persist
         await crud_recommended_course.update_status_and_data(
@@ -742,7 +550,8 @@ async def process_recommendation_task(
 
         logger.info(
             f"Course Recommendation task completed for {recommendation_id}: "
-            f"{len(filtered_courses)} iGOT + {len(general_courses)} public courses"
+            f"{len(final_filtered_courses)} courses with relevancy >= 80 "
+            f"(from {len(filtered_courses)} iGOT + {len(general_courses)} public candidates)"
         )
 
     except Exception as e:
@@ -750,7 +559,7 @@ async def process_recommendation_task(
         try:
             await crud_recommended_course.update_status_to_failed(recommendation_id, str(e))
         except Exception:
-            logger.exception("CRITICAL: Failed to update status to FAILED:")
+            logger.exception(f"Failed to update course recommendation record to FAILED for {recommendation_id}")
 
 @router.post("/course-recommendations/generate", response_model=RecommendedCourseResponse, status_code=status.HTTP_202_ACCEPTED)
 async def generate_course_recommendations(
@@ -762,20 +571,20 @@ async def generate_course_recommendations(
     """Generate Course Recommedation by role mapping ID"""
     try:
         role_mapping_id = request.role_mapping_id
-        logger.info(f"Generating course recommendations for role mapping: {role_mapping_id} by user: {current_user.user_id}")
+        logger.info(f"Generate course recommendations request received for role mapping: {role_mapping_id} by user: {current_user.user_id}")
         
         # Get role mapping
         role_mapping = await crud_role_mapping.get_by_id_and_user(db, role_mapping_id, current_user.user_id)
         if not role_mapping:
-            logger.warning(f"Role mapping with ID {role_mapping_id} not found")
+            logger.warning(f"Role mapping not found for ID: {role_mapping_id}")
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="Role mapping not found"
+                detail="Role mapping not found."
             )
         
         existing_recommendation = await crud_recommended_course.get_by_role_mapping_id(db, role_mapping_id, current_user.user_id)
         if existing_recommendation:
-            print(f"Found existing recommendation for Role mapping ID: {role_mapping_id}")
+            logger.info(f"Found existing recommendation for Role mapping ID: {role_mapping_id}")
             current_status = existing_recommendation.status
             
             if current_status == RecommendationStatus.IN_PROGRESS:
@@ -790,7 +599,7 @@ async def generate_course_recommendations(
                 )
             
             if current_status == RecommendationStatus.FAILED:
-                logger.info("Found failed records. Cleaning up to retry...")
+                logger.info("Previous recommendation failed. Deleting existing record and initiating a new recommendation.")
                 # Delete all records matching the filter to ensure a clean slate
                 await db.delete(existing_recommendation)
                 await db.commit()
@@ -824,15 +633,15 @@ Competencies (with definitions):
             role_mapping.competencies or [],
         )
 
-        logger.info(f"Initiated background generation for {new_recommendation.id}")
+        logger.info(f"Course recommendation generation initiated for role mapping: {role_mapping_id}")
         return new_recommendation
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("Error initiating course recommendation:")
+        logger.exception("Error in generate course recommendations endpoint:")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to initiating course recommendations: {str(e)}"
+            detail="Failed to generate course recommendations. Please try again later."
         )
 
 @router.get("/course-recommendations", response_model=RecommendedCourseResponse)
