@@ -34,10 +34,65 @@ class CRUDRecommendedCourse:
         async with sessionmanager.session() as db:
             return await self._get_by_id_in_session(db, recommendation_id)
 
+    async def get_by_role_mapping_ids_bulk(
+        self,
+        db: AsyncSession,
+        role_mapping_ids: List[uuid.UUID],
+        user_id: uuid.UUID
+    ) -> List[RecommendedCourse]:
+        """
+        Retrieves all RecommendedCourse records for a set of role mapping IDs owned by
+        user_id, in one query instead of one-per-id. Used by the bulk generate endpoint's
+        idempotency check.
+        """
+        if not role_mapping_ids:
+            return []
+        stmt = select(RecommendedCourse).filter(
+            RecommendedCourse.role_mapping_id.in_(role_mapping_ids),
+            RecommendedCourse.user_id == user_id
+        )
+        result = await db.execute(stmt)
+        return result.scalars().all()
+
+    async def create_bulk(
+        self,
+        db: AsyncSession,
+        user_id: uuid.UUID,
+        role_mapping_ids: List[uuid.UUID],
+        status: RecommendationStatus = "IN_PROGRESS"
+    ) -> List[RecommendedCourse]:
+        """
+        Creates one IN_PROGRESS placeholder RecommendedCourse row per role_mapping_id in a
+        single transaction/commit, instead of N sequential ORM create() calls. Keeps the
+        bulk generate endpoint's synchronous (pre-202) portion fast regardless of how many
+        role mappings were derived for a state/department.
+
+        No per-row refresh() afterwards: `id` is a client-side Python default
+        (default=uuid.uuid4 on the model), so it's already populated on each instance once
+        flushed by commit() — refreshing would cost one extra round trip per row, which
+        would reintroduce the N-round-trip problem this method exists to avoid.
+        """
+        if not role_mapping_ids:
+            return []
+        new_recommendations = [
+            RecommendedCourse(
+                user_id=user_id,
+                role_mapping_id=role_mapping_id,
+                status=status,
+                vector_query="",
+                actual_courses=[],
+                filtered_courses=[]
+            )
+            for role_mapping_id in role_mapping_ids
+        ]
+        db.add_all(new_recommendations)
+        await db.commit()
+        return new_recommendations
+
     async def get_by_role_mapping_id(
-        self, 
-        db: AsyncSession, 
-        role_mapping_id: uuid.UUID, 
+        self,
+        db: AsyncSession,
+        role_mapping_id: uuid.UUID,
         user_id: uuid.UUID # Added user_id filter
     ) -> Optional[RecommendedCourse]:
         """

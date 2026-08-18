@@ -168,6 +168,20 @@ class Settings(BaseSettings):
 
     COURSE_RECOMMENDATION_MIN_RELEVANCY: int = 80
 
+    COURSE_RECOMMENDATION_BULK_MAX_CONCURRENCY: int = Field(
+        default=6,
+        description="Max number of role-mapping recommendations processed concurrently inside one "
+                     "bulk-generate background task. Each item's own pipeline opens roughly 4-5 "
+                     "concurrent DB sessions, so with pool_size=20 + max_overflow=40 (60 total "
+                     "connections), 6 concurrent items leaves headroom for other traffic."
+    )
+    COURSE_RECOMMENDATION_BULK_LOG_THRESHOLD: int = Field(
+        default=30,
+        description="Informational threshold only (not a hard cap): if a bulk-generate request's "
+                     "derived role-mapping count exceeds this, a warning is logged noting the batch "
+                     "is larger than typical and will take proportionally longer."
+    )
+
     # Notification service settings
     ENABLE_EMAIL_NOTIFICATION: bool = Field(
         default=False,

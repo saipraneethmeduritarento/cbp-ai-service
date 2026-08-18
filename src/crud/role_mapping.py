@@ -164,6 +164,42 @@ class CRUDRoleMapping:
         
         return role_mappings
 
+    async def get_completed_by_state_and_department(
+        self,
+        db: AsyncSession,
+        user_id: uuid.UUID,
+        state_center_id: str,
+        department_id: Optional[str] = None
+    ) -> List[RoleMapping]:
+        """
+        Retrieves every COMPLETED RoleMapping owned by user_id under a state/department,
+        with full columns (unlike get_reorder_list's lightweight projection) so callers
+        can build an LLM-facing profile (state_center_name, department_name, sector_name,
+        designation_name, wing_division_section, role_responsibilities, activities,
+        competencies) without a second query per row.
+
+        department_id omitted means org-level mappings only (department_id IS NULL),
+        matching the convention already used by search() and get_reorder_list().
+        """
+        conditions = [
+            RoleMapping.user_id == user_id,
+            RoleMapping.status == ProcessingStatus.COMPLETED,
+            RoleMapping.state_center_id == state_center_id,
+        ]
+        if department_id:
+            conditions.append(RoleMapping.department_id == department_id)
+        else:
+            conditions.append(RoleMapping.department_id.is_(None))
+
+        stmt = (
+            select(RoleMapping)
+            .where(and_(*conditions))
+            .order_by(asc(RoleMapping.sort_order))
+            .options(noload(RoleMapping.cbp_plans))
+        )
+        result = await db.execute(stmt)
+        return result.scalars().all()
+
     async def search(
         self,
         db: AsyncSession,

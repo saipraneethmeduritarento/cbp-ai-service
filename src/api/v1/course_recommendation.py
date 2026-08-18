@@ -13,8 +13,16 @@ from google.genai import types
 from ...prompts.prompts import COURSE_SELECTION_SYSTEM_PROMPT, DESIGNNATION_GROUP_SYSTEM_PROMPT, VECTOR_QUERY_SYSTEM_PROMPT
 
 from ...models.course_recommendation import RecommendationStatus
+from ...models.role_mapping import RoleMapping
 from ...models.user import User
-from ...schemas.course_recommendation import RecommendCourseCreate, RecommendedCourseResponse
+from ...schemas.course_recommendation import (
+    RecommendCourseCreate,
+    RecommendedCourseResponse,
+    BulkRecommendCourseCreate,
+    BulkGenerateCourseRecommendationsResponse,
+    BulkRecommendationItemResult,
+    BulkRecommendationItemStatus,
+)
 
 from ...core.database import get_db_session
 from ...core.logger import logger
@@ -323,6 +331,26 @@ async def get_general_courses_from_gemini(user_profile) -> List[Dict[str, Any]]:
         print(f"Error fetching general courses from Gemini: {e}")
         return []
 
+def _build_user_profile_text(role_mapping: RoleMapping) -> str:
+    """
+    Pure formatter: RoleMapping ORM -> the LLM-facing user_profile text blob consumed by
+    generate_contextual_queries/get_filtered_courses_by_llm. Shared by the single-item and
+    bulk generate endpoints so both build an identical prompt.
+    """
+    competencies_json = json.dumps(role_mapping.competencies, indent=2) if role_mapping.competencies else "[]"
+    return f"""
+Ministry/State/Organisation: {role_mapping.state_center_name}
+Department Name: {role_mapping.department_name if role_mapping.department_name else 'N/A'}
+Sector: {role_mapping.sector_name if role_mapping.sector_name else 'N/A'}
+Designation Name: {role_mapping.designation_name}
+Wing/Division/Section: {role_mapping.wing_division_section if role_mapping.wing_division_section else 'N/A'}
+Roles & Responsibilities: {role_mapping.role_responsibilities}
+Key Activities: {role_mapping.activities}
+Competencies (with definitions):
+{competencies_json}
+"""
+
+
 def _build_competency_query(competencies: list) -> str:
     """
     Mechanically construct a query string from the user's competency JSONB list
@@ -590,6 +618,45 @@ async def process_recommendation_task(
         except Exception:
             logger.exception(f"Failed to update course recommendation record to FAILED for {recommendation_id}")
 
+
+async def process_bulk_recommendation_task(items: List[Dict[str, Any]]) -> None:
+    """
+    Background task for the bulk endpoint: fans out N per-item recommendation runs
+    concurrently, capped at settings.COURSE_RECOMMENDATION_BULK_MAX_CONCURRENCY in-flight
+    items at once via an asyncio.Semaphore, to protect the shared DB connection pool.
+    Each item's own process_recommendation_task run already opens several concurrent
+    sessionmanager.session() calls, so uncapped concurrency across a large batch could
+    spike DB session usage well past the pool ceiling.
+
+    items: one dict per queued row, each with keys recommendation_id, user_profile,
+    ministry_state_name, department_name, raw_competencies — i.e. exactly
+    process_recommendation_task's keyword args.
+    """
+    logger.info(f"Starting bulk course recommendation background task for {len(items)} role mappings")
+    semaphore = asyncio.Semaphore(settings.COURSE_RECOMMENDATION_BULK_MAX_CONCURRENCY)
+
+    async def _run_one(index: int, item: Dict[str, Any]) -> None:
+        async with semaphore:
+            try:
+                await process_recommendation_task(
+                    item["recommendation_id"],
+                    item["user_profile"],
+                    item["ministry_state_name"],
+                    item["department_name"],
+                    item["raw_competencies"],
+                )
+            except Exception:
+                # Defense-in-depth only: process_recommendation_task already catches every
+                # exception internally and persists FAILED on its own row, so this should
+                # never trigger except on a bug in the orchestrator itself (e.g. a malformed
+                # item dict). Catching here keeps one bad entry from aborting the rest via
+                # asyncio.gather.
+                logger.exception(f"Unexpected error processing bulk item {index}/{len(items)}")
+
+    await asyncio.gather(*(_run_one(i, item) for i, item in enumerate(items, start=1)))
+    logger.info(f"Bulk course recommendation background task completed for {len(items)} role mappings")
+
+
 @router.post("/course-recommendations/generate", response_model=RecommendedCourseResponse, status_code=status.HTTP_202_ACCEPTED)
 async def generate_course_recommendations(
     request: RecommendCourseCreate,
@@ -630,18 +697,7 @@ async def generate_course_recommendations(
             if current_status == RecommendationStatus.FAILED:
                 return existing_recommendation
         
-        competencies_json = json.dumps(role_mapping.competencies, indent=2) if role_mapping.competencies else "[]"
-        user_profile = f"""
-Ministry/State/Organisation: {role_mapping.state_center_name}
-Department Name: {role_mapping.department_name if role_mapping.department_name else 'N/A'}
-Sector: {role_mapping.sector_name if role_mapping.sector_name else 'N/A'}
-Designation Name: {role_mapping.designation_name}
-Wing/Division/Section: {role_mapping.wing_division_section if role_mapping.wing_division_section else 'N/A'}
-Roles & Responsibilities: {role_mapping.role_responsibilities}
-Key Activities: {role_mapping.activities}
-Competencies (with definitions):
-{competencies_json}
-"""
+        user_profile = _build_user_profile_text(role_mapping)
 
         new_recommendation = await crud_recommended_course.create(
             db,
@@ -668,6 +724,130 @@ Competencies (with definitions):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to generate course recommendations. Please try again later."
+        )
+
+@router.post(
+    "/course-recommendations/bulk-generate",
+    response_model=BulkGenerateCourseRecommendationsResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def generate_course_recommendations_bulk(
+    request: BulkRecommendCourseCreate,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Generate course recommendations for every COMPLETED role mapping under a
+    state/department in one go. Role mappings are derived server-side (not supplied
+    as an explicit id list), so ownership is guaranteed by construction and there is
+    no client-facing "not found"/"duplicate" handling to do.
+    """
+    try:
+        logger.info(
+            f"Bulk generate course recommendations requested for state_center_id: "
+            f"{request.state_center_id}, department_id: {request.department_id} "
+            f"by user: {current_user.user_id}"
+        )
+
+        role_mappings = await crud_role_mapping.get_completed_by_state_and_department(
+            db, current_user.user_id, request.state_center_id, request.department_id
+        )
+        if not role_mappings:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No completed role mappings found for this state/department."
+            )
+
+        if len(role_mappings) > settings.COURSE_RECOMMENDATION_BULK_LOG_THRESHOLD:
+            logger.warning(
+                f"Bulk generate request for state_center_id: {request.state_center_id}, "
+                f"department_id: {request.department_id} derived {len(role_mappings)} role "
+                f"mappings, exceeding COURSE_RECOMMENDATION_BULK_LOG_THRESHOLD "
+                f"({settings.COURSE_RECOMMENDATION_BULK_LOG_THRESHOLD}); this will take "
+                f"proportionally longer to process."
+            )
+
+        role_mapping_ids = [rm.id for rm in role_mappings]
+        existing_recommendations = await crud_recommended_course.get_by_role_mapping_ids_bulk(
+            db, role_mapping_ids, current_user.user_id
+        )
+        existing_by_role_mapping_id = {rec.role_mapping_id: rec for rec in existing_recommendations}
+
+        status_map = {
+            RecommendationStatus.IN_PROGRESS: BulkRecommendationItemStatus.ALREADY_IN_PROGRESS,
+            RecommendationStatus.COMPLETED: BulkRecommendationItemStatus.ALREADY_COMPLETED,
+            RecommendationStatus.FAILED: BulkRecommendationItemStatus.ALREADY_FAILED,
+        }
+
+        role_mappings_to_queue = [rm for rm in role_mappings if rm.id not in existing_by_role_mapping_id]
+
+        new_recommendation_by_role_mapping_id = {}
+        if role_mappings_to_queue:
+            new_recommendations = await crud_recommended_course.create_bulk(
+                db,
+                current_user.user_id,
+                [rm.id for rm in role_mappings_to_queue],
+                RecommendationStatus.IN_PROGRESS,
+            )
+            new_recommendation_by_role_mapping_id = {
+                rec.role_mapping_id: rec for rec in new_recommendations
+            }
+
+        # Single pass over role_mappings (already sort_order-ordered) so `items` reflects
+        # the same order regardless of which mappings were already-existing vs newly queued.
+        items: List[BulkRecommendationItemResult] = []
+        queued_for_processing = []
+        for role_mapping in role_mappings:
+            existing = existing_by_role_mapping_id.get(role_mapping.id)
+            if existing:
+                items.append(BulkRecommendationItemResult(
+                    role_mapping_id=role_mapping.id,
+                    designation_name=role_mapping.designation_name,
+                    status=status_map.get(existing.status, BulkRecommendationItemStatus.ALREADY_COMPLETED),
+                    recommendation_id=existing.id,
+                ))
+            else:
+                new_recommendation = new_recommendation_by_role_mapping_id[role_mapping.id]
+                items.append(BulkRecommendationItemResult(
+                    role_mapping_id=role_mapping.id,
+                    designation_name=role_mapping.designation_name,
+                    status=BulkRecommendationItemStatus.QUEUED,
+                    recommendation_id=new_recommendation.id,
+                ))
+                queued_for_processing.append({
+                    "recommendation_id": new_recommendation.id,
+                    "user_profile": _build_user_profile_text(role_mapping),
+                    "ministry_state_name": role_mapping.state_center_name or "",
+                    "department_name": role_mapping.department_name or "",
+                    "raw_competencies": role_mapping.competencies or [],
+                })
+
+        if queued_for_processing:
+            background_tasks.add_task(process_bulk_recommendation_task, queued_for_processing)
+
+        queued_count = len(queued_for_processing)
+        logger.info(
+            f"Bulk generate for state_center_id: {request.state_center_id}, "
+            f"department_id: {request.department_id} queued {queued_count} of "
+            f"{len(role_mappings)} role mappings"
+        )
+
+        return BulkGenerateCourseRecommendationsResponse(
+            state_center_id=request.state_center_id,
+            department_id=request.department_id,
+            total_role_mappings=len(role_mappings),
+            queued_count=queued_count,
+            already_existing_count=len(role_mappings) - queued_count,
+            items=items,
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Error in bulk generate course recommendations endpoint:")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate bulk course recommendations. Please try again later."
         )
 
 @router.get("/course-recommendations", response_model=RecommendedCourseResponse)
