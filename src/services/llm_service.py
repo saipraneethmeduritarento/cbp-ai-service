@@ -15,6 +15,8 @@ Sections, top to bottom:
   * the port                — Capability, LLMProvider / EmbeddingProvider ABCs
   * Gemini adapter          — native google-genai (the default)
   * LangChain adapter       — OpenAI / Anthropic / others
+  * Langfuse tracing        — a decorator over the port; installed by the factory only when
+                               tracing is switched on (see src/core/tracing.py)
   * factory                 — get_llm() / get_embedder(), the one place that picks which
                                adapter backs the port
   * tasks                   — every prompt / response schema / generation config this app
@@ -34,6 +36,7 @@ import time
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from enum import Enum
 from functools import lru_cache
 from typing import Any, AsyncIterator, Dict, List, Literal, Optional, Sequence, Union
@@ -42,8 +45,10 @@ from google import genai
 from google.genai import types as gtypes
 from pydantic import BaseModel, Field
 
+from ..core import tracing
 from ..core.configs import LLMProviderOption, settings
 from ..core.logger import logger
+from ..core.tracing import traced_task
 from ..prompts.prompts import (
     ACBP_DOCUMENT_SUMMARY_PROMPT,
     COURSE_SELECTION_SYSTEM_PROMPT,
@@ -945,6 +950,257 @@ class LangChainEmbeddingProvider(EmbeddingProvider):
 
 
 # =============================================================================
+# Langfuse tracing — a decorator over the port, so neither adapter (nor any call site) knows
+# tracing exists. Installed by the factories below and only when tracing is actually on: with
+# LANGFUSE_ENABLED unset, get_llm() returns the bare adapter and none of this code runs.
+#
+# What lands in a trace per call: the prompt (text truncated, binary parts replaced by a
+# "<application/pdf, 2.4 MB>" placeholder), the generation config, the response text, token
+# usage, latency, and ERROR level plus the exception on failure.
+# =============================================================================
+
+def _format_bytes(size: int) -> str:
+    if size >= 1024 * 1024:
+        return f"{size / (1024 * 1024):.1f} MB"
+    if size >= 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size} bytes"
+
+
+def _trace_part(part: Part) -> dict:
+    """One neutral Part as trace-safe JSON. Binary data is described, never included — a 3 MB
+    PDF base64'd into a trace would be both useless and larger than the ingestion limit."""
+    if part.data is not None:
+        return {"media": f"{part.mime_type or 'application/octet-stream'}, {_format_bytes(len(part.data))}"}
+    return {"text": tracing.truncate(part.text or "")}
+
+
+def _trace_input(contents: str | Sequence[Message]) -> Any:
+    if isinstance(contents, str):
+        return tracing.truncate(contents)
+    return [
+        {"role": message.role.value, "parts": [_trace_part(p) for p in message.parts]}
+        for message in contents
+    ]
+
+
+def _trace_model_params(config: GenerationConfig) -> dict:
+    """Only the parameters actually set — an unset value is the provider default, and recording
+    it as null would misreport it as an explicit choice."""
+    params = {
+        "temperature": config.temperature,
+        "top_p": config.top_p,
+        "max_output_tokens": config.max_output_tokens,
+        "seed": config.seed,
+        "thinking_budget": config.thinking_budget,
+    }
+    return {k: v for k, v in params.items() if v is not None}
+
+
+def _schema_name(schema: Any) -> str | None:
+    if schema is None:
+        return None
+    if isinstance(schema, type):
+        return schema.__name__
+    if isinstance(schema, dict):
+        return schema.get("title")
+    return None
+
+
+def _trace_metadata(config: GenerationConfig) -> dict:
+    metadata: dict = {"json_output": config.json_output, "safety": config.safety.value}
+    if config.system_instruction:
+        metadata["system_instruction"] = tracing.truncate(config.system_instruction)
+    if config.tools:
+        metadata["tools"] = [t.value for t in config.tools]
+    if (schema_name := _schema_name(config.response_schema)) is not None:
+        metadata["response_schema"] = schema_name
+    return metadata
+
+
+def _trace_structured_output(value: Any) -> Any:
+    """Parsed structured output for a trace: kept as JSON so Langfuse renders it as a tree,
+    unless it is over the payload cap, in which case it degrades to a truncated string."""
+    try:
+        serialized = json.dumps(value, default=str)
+    except Exception:
+        return tracing.truncate(str(value))
+    if len(serialized) <= settings.LANGFUSE_MAX_PAYLOAD_CHARS:
+        return value
+    return tracing.truncate(serialized)
+
+
+def _usage_details(usage: Usage | None) -> dict | None:
+    if usage is None:
+        return None
+    return {
+        "input": usage.input_tokens,
+        "output": usage.output_tokens,
+        "total": usage.total_tokens,
+    }
+
+
+class TracedLLMProvider(LLMProvider):
+    """Wraps an LLMProvider so every call becomes a Langfuse observation.
+
+    Two details worth preserving:
+      * `self.name` mirrors the inner adapter's name, because it appears in errors callers see
+        ("Empty response from {self.name}/{model}", LLMSchemaError) — wrapping must not change
+        those strings.
+      * `_record_usage` is left entirely to the inner adapter, so the existing `LLM usage: ...`
+        log line is identical whether tracing is on or off. Langfuse is an addition to that
+        logging, not a replacement for it.
+
+    `generate_structured` is inherited-and-wrapped rather than delegated: the ABC implementation
+    calls `self.generate`, so the first attempt and the repair retry each become a generation
+    under one span. If an adapter ever overrides `generate_structured`, this wrapper must be
+    changed to delegate to the inner method instead, or that override will be bypassed.
+    """
+
+    def __init__(self, inner: LLMProvider):
+        self._inner = inner
+        self.name = inner.name
+
+    def supports(self, capability: Capability) -> bool:
+        return self._inner.supports(capability)
+
+    async def generate(
+        self,
+        contents: str | Sequence[Message],
+        *,
+        model: str,
+        config: GenerationConfig | None = None,
+    ) -> LLMResponse:
+        config = config or GenerationConfig()
+        with tracing.observation(
+            f"{self.name}.generate",
+            as_type="generation",
+            input=_trace_input(contents),
+            model=resolve_model(model),
+            model_parameters=_trace_model_params(config),
+            metadata=_trace_metadata(config),
+        ) as observation:
+            try:
+                response = await self._inner.generate(contents, model=model, config=config)
+            except Exception as e:
+                observation.update(level="ERROR", status_message=f"{type(e).__name__}: {e}")
+                raise
+            observation.update(
+                output=tracing.truncate(response.text),
+                # The response reports the model that actually served the request, which an
+                # LLM_MODEL_MAP redirect can make different from the one asked for.
+                model=response.model,
+                usage_details=_usage_details(response.usage),
+            )
+            return response
+
+    async def stream(
+        self,
+        contents: str | Sequence[Message],
+        *,
+        model: str,
+        config: GenerationConfig | None = None,
+    ) -> AsyncIterator[str]:
+        config = config or GenerationConfig()
+        # detached_observation, not observation: this is an async generator, and an attached OTEL
+        # context cannot be safely carried across `yield`.
+        with tracing.detached_observation(
+            f"{self.name}.stream",
+            as_type="generation",
+            input=_trace_input(contents),
+            model=resolve_model(model),
+            model_parameters=_trace_model_params(config),
+            metadata=_trace_metadata(config),
+        ) as observation:
+            chunks: list[str] = []
+            first_chunk_at: datetime | None = None
+            try:
+                async for chunk in self._inner.stream(contents, model=model, config=config):
+                    if first_chunk_at is None:
+                        first_chunk_at = datetime.now(timezone.utc)
+                    chunks.append(chunk)
+                    yield chunk
+            except Exception as e:
+                observation.update(level="ERROR", status_message=f"{type(e).__name__}: {e}")
+                raise
+            finally:
+                # In `finally` so a consumer that abandons the stream still gets whatever was
+                # produced recorded, rather than an observation with no output at all.
+                observation.update(
+                    output=tracing.truncate("".join(chunks)),
+                    completion_start_time=first_chunk_at,
+                )
+        # No usage_details: neither adapter's stream() reads token counts off the stream.
+
+    async def generate_structured(
+        self,
+        contents: str | Sequence[Message],
+        *,
+        model: str,
+        schema: Any,
+        config: GenerationConfig | None = None,
+    ) -> Any:
+        with tracing.observation(
+            f"{self.name}.generate_structured",
+            as_type="span",
+            metadata={"response_schema": _schema_name(schema), "model": resolve_model(model)},
+        ) as observation:
+            try:
+                result = await super().generate_structured(
+                    contents, model=model, schema=schema, config=config
+                )
+            except Exception as e:
+                observation.update(level="ERROR", status_message=f"{type(e).__name__}: {e}")
+                raise
+            output = result.model_dump() if isinstance(result, BaseModel) else result
+            observation.update(output=_trace_structured_output(output))
+            return result
+
+
+class TracedEmbeddingProvider(EmbeddingProvider):
+    """Wraps an EmbeddingProvider so each embed_batch — one API request — becomes an
+    "embedding" observation.
+
+    The vectors are not recorded: they are hundreds of floats per text, would dwarf every other
+    payload in the trace and are unreadable anyway. The count and width are what actually help
+    when a batch comes back misaligned or at the wrong dimensionality.
+
+    `embed()` is inherited from the ABC, so a large call that chunks into several batches
+    produces one observation per batch.
+    """
+
+    def __init__(self, inner: EmbeddingProvider):
+        self._inner = inner
+        self.name = inner.name
+
+    async def embed_batch(
+        self,
+        texts: Sequence[str],
+        *,
+        model: str,
+        dimensions: int | None = None,
+    ) -> list[list[float]]:
+        texts = list(texts)
+        with tracing.observation(
+            f"{self.name}.embed_batch",
+            as_type="embedding",
+            input=[tracing.truncate(t) for t in texts],
+            model=resolve_model(model),
+            model_parameters={"dimensions": dimensions} if dimensions else {},
+        ) as observation:
+            try:
+                vectors = await self._inner.embed_batch(texts, model=model, dimensions=dimensions)
+            except Exception as e:
+                observation.update(level="ERROR", status_message=f"{type(e).__name__}: {e}")
+                raise
+            observation.update(output={
+                "embeddings": len(vectors),
+                "dimensions": len(vectors[0]) if vectors else 0,
+            })
+            return vectors
+
+
+# =============================================================================
 # Factory — the one place that decides which adapter backs the port.
 # =============================================================================
 
@@ -952,9 +1208,9 @@ class LangChainEmbeddingProvider(EmbeddingProvider):
 def get_llm(provider: LLMProviderOption | None = None) -> LLMProvider:
     provider = provider or settings.LLM_PROVIDER
     if provider == LLMProviderOption.GEMINI:
-        return GeminiProvider()
+        return _traced(GeminiProvider())
     if provider == LLMProviderOption.LANGCHAIN:
-        return LangChainProvider()
+        return _traced(LangChainProvider())
     raise ValueError(f"Unknown LLM provider: {provider}")
 
 
@@ -962,10 +1218,21 @@ def get_llm(provider: LLMProviderOption | None = None) -> LLMProvider:
 def get_embedder(provider: LLMProviderOption | None = None) -> EmbeddingProvider:
     provider = provider or settings.LLM_EMBEDDING_PROVIDER
     if provider == LLMProviderOption.GEMINI:
-        return GeminiEmbeddingProvider()
+        return _traced_embedder(GeminiEmbeddingProvider())
     if provider == LLMProviderOption.LANGCHAIN:
-        return LangChainEmbeddingProvider()
+        return _traced_embedder(LangChainEmbeddingProvider())
     raise ValueError(f"Unknown embedding provider: {provider}")
+
+
+def _traced(provider: LLMProvider) -> LLMProvider:
+    """Returns `provider` untouched when tracing is off — no wrapper, no payload serialization."""
+    return TracedLLMProvider(provider) if tracing.tracing_enabled() else provider
+
+
+def _traced_embedder(provider: EmbeddingProvider) -> EmbeddingProvider:
+    if tracing.tracing_enabled() and settings.LANGFUSE_TRACE_EMBEDDINGS:
+        return TracedEmbeddingProvider(provider)
+    return provider
 
 
 # =============================================================================
@@ -1209,18 +1476,21 @@ async def _summarize_pdf(pdf_bytes: bytes, prompt: str, label: str) -> str:
     return response.text
 
 
+@traced_task()
 async def summarize_acbp_plan(pdf_bytes: bytes) -> str:
     """Summarize an ACBP Plan PDF. Returns "" on an empty model response."""
     logger.info("Generating ACBP Plan summary")
     return await _summarize_pdf(pdf_bytes, ACBP_DOCUMENT_SUMMARY_PROMPT, "ACBP Plan")
 
 
+@traced_task()
 async def summarize_work_allocation(pdf_bytes: bytes) -> str:
     """Summarize a Work Allocation Order PDF. Returns "" on an empty model response."""
     logger.info("Generating Work Allocation Order summary")
     return await _summarize_pdf(pdf_bytes, _WORK_ALLOCATION_SUMMARY_PROMPT, "Work Allocation Order")
 
 
+@traced_task()
 async def summarize_uploaded_document(pdf_bytes: bytes) -> str:
     """Summarize an uploaded document PDF (the /files/{id}/summary background task)."""
     contents = [Message.user(Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"), DOCUMENT_SUMMARY_PROMPT)]
@@ -1229,6 +1499,7 @@ async def summarize_uploaded_document(pdf_bytes: bytes) -> str:
     return response.text
 
 
+@traced_task()
 async def summarize_across_documents(joined_summaries: str) -> str:
     """Roll several per-document summaries up into one meta-summary."""
     contents = [Message.user(META_SUMMARY_PROMPT.format(payload=joined_summaries))]
@@ -1260,6 +1531,7 @@ def _build_role_mapping_prompt_v1(organization_data: Dict[str, Any]) -> str:
     )
 
 
+@traced_task()
 async def generate_role_mapping_v1(
     organization_data: Dict[str, Any],
     additional_document_contents: List[bytes] | None = None,
@@ -1281,6 +1553,7 @@ async def generate_role_mapping_v1(
     return json.loads(_strip_code_fences(response.text))
 
 
+@traced_task()
 async def stream_role_mapping_v1(
     organization_data: Dict[str, Any],
     additional_document: bytes | None = None,
@@ -1300,6 +1573,7 @@ async def stream_role_mapping_v1(
     yield {"type": "final", "data": json.loads(_strip_code_fences("".join(buffer)))}
 
 
+@traced_task()
 async def generate_designation_role_mapping_v1(
     org_name: str, dep_name: str, designation: str, sector: str, instruction: str,
     acbp_summary: str, work_allocation_summary: str,
@@ -1328,6 +1602,7 @@ async def generate_designation_role_mapping_v1(
 # Role mapping — v2
 # ---------------------------------------------------------------------------
 
+@traced_task()
 async def generate_role_mapping_v2(organization_data: Dict[str, Any]) -> Any:
     """v2 single-pass role mapping. Returns the parsed JSON (a list of mappings)."""
     is_state = _is_state(organization_data)
@@ -1350,6 +1625,7 @@ async def generate_role_mapping_v2(organization_data: Dict[str, Any]) -> Any:
     return json.loads(_strip_code_fences(response.text))
 
 
+@traced_task()
 async def generate_designation_role_mapping_v2(
     org_name: str, dep_name: str, designation: str, sector: str, instruction: str,
     primary_summary: str,
@@ -1378,6 +1654,7 @@ async def generate_designation_role_mapping_v2(
 # Role mapping — v3 (multi-pass)
 # ---------------------------------------------------------------------------
 
+@traced_task()
 async def extract_designations(organization_data: Dict[str, Any]) -> DesignationExtractionResponse:
     """v3 PASS 1: extract every unique designation, hierarchically ordered, from the WAO
     document summaries. Uses the FLASH model — factual extraction, no creativity."""
@@ -1407,6 +1684,7 @@ async def extract_designations(organization_data: Dict[str, Any]) -> Designation
     )
 
 
+@traced_task()
 async def generate_frac_batch(
     designations_batch: List[Dict[str, Any]],
     organization_data: Dict[str, Any],
@@ -1443,6 +1721,7 @@ async def generate_frac_batch(
 # Course recommendation
 # ---------------------------------------------------------------------------
 
+@traced_task()
 async def embed_search_query(text: str) -> List[float]:
     """Embed one search query for course vector search. Returns [] for blank input or on
     failure, matching the caller's existing tolerance for missing embeddings."""
@@ -1461,6 +1740,7 @@ async def embed_search_query(text: str) -> List[float]:
         return []
 
 
+@traced_task()
 async def generate_contextual_queries(user_profile: str) -> Dict[str, Any]:
     """Derive three vector-search queries plus a keyword list from a role profile:
     keyword_query, description_query, combined_query, search_keywords."""
@@ -1477,6 +1757,7 @@ async def generate_contextual_queries(user_profile: str) -> Dict[str, Any]:
     return result
 
 
+@traced_task()
 async def infer_designation_group(user_profile: str) -> str:
     """Classify a role profile into Group A/B (senior/gazetted) or C/D (supporting/clerical).
     Defaults to "AB" on any failure, since this only biases retrieval."""
@@ -1497,6 +1778,7 @@ async def infer_designation_group(user_profile: str) -> str:
         return "AB"
 
 
+@traced_task()
 async def filter_courses(
     courses_prompt: str,
     user_profile: str,
@@ -1540,6 +1822,7 @@ Candidate Courses:
     return response.text
 
 
+@traced_task()
 async def fetch_general_courses(user_profile: str) -> List[Dict[str, Any]]:
     """Web-search public courses across external learning platforms.
 
@@ -1603,6 +1886,7 @@ DESIGNATION_EMBEDDING_DIMENSIONS = 768
 _DESIGNATION_EMBED_PREFIX = "task: sentence similarity | query: "
 
 
+@traced_task()
 async def embed_designations(designations: List[str]) -> List[List[float]]:
     """Embed designation names for pgvector similarity matching against the iGOT designation
     master. Redis caching lives in the caller, which owns the cache keying."""

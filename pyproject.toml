@@ -27,6 +27,10 @@ dependencies = [
     "redis[asyncio]>=5.0.0",
     "bs4>=0.0.2",
     "openpyxl>=3.1.5",
+    # LLM tracing — see src/core/tracing.py. A base dependency rather than an extra because
+    # every deployment should be able to turn tracing on with env vars alone; the SDK stays
+    # inert (and is never even imported) unless LANGFUSE_ENABLED is set.
+    "langfuse>=3.0",
 ]
 
 [project.optional-dependencies]

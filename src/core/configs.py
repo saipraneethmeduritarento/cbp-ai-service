@@ -102,6 +102,23 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str = Field(default="", description="Required only when routing to openai:* models")
     ANTHROPIC_API_KEY: str = Field(default="", description="Required only when routing to anthropic:* models")
 
+    # Langfuse LLM tracing — see src/core/tracing.py. Off unless LANGFUSE_ENABLED is true AND
+    # both keys are set; anything less installs no tracing wrapper at all, so a deployment that
+    # does not configure Langfuse behaves exactly as it did before tracing existed.
+    LANGFUSE_ENABLED: bool = Field(default=False, description="Master switch for Langfuse tracing of LLM calls")
+    LANGFUSE_PUBLIC_KEY: str = Field(default="", description="Langfuse project public key (pk-lf-...)")
+    LANGFUSE_SECRET_KEY: str = Field(default="", description="Langfuse project secret key (sk-lf-...)")
+    LANGFUSE_HOST: str = Field(default="", description="Base URL of the self-hosted Langfuse instance; empty means the SDK default (Langfuse Cloud)")
+    LANGFUSE_SAMPLE_RATE: float = Field(default=1.0, description="Fraction of traces exported, 0.0-1.0 (1.0 = all)")
+    LANGFUSE_MAX_PAYLOAD_CHARS: int = Field(
+        default=20_000,
+        description="Per-field cap on traced prompt/response text. Role-mapping prompts inline "
+                    "the whole KCM competency master, which would otherwise exceed Langfuse's "
+                    "per-event size limit."
+    )
+    LANGFUSE_TRACE_EMBEDDINGS: bool = Field(default=True, description="Also trace embedding calls (the vectors themselves are never sent, only input text and vector count/width)")
+    LANGFUSE_DEBUG: bool = Field(default=False, description="Verbose Langfuse SDK logging")
+
     KB_BASE_URL: str
     KB_AUTH_TOKEN: str
 
