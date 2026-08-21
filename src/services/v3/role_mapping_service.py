@@ -16,6 +16,7 @@ from ...prompts.v3.prompts import (
 )
 from ...crud.document import crud_document
 from ...core.logger import logger
+from ...core import tracing
 
 with open("data/withidentifier_competencies.json") as f:
     COMPETENCY_MAPPING = json.load(f)
@@ -269,30 +270,26 @@ class RoleMappingService:
                         )
                 )]
             )
-        ]
-        
-        generate_content_config = types.GenerateContentConfig(
-            system_instruction=DESIGNATION_EXTRACTION_PROMPT,
-            temperature=0.1,   # Very low — factual extraction, no creativity
-            top_p=0.85, # Restrict to high-probability tokens
-            response_mime_type="application/json",
-            response_schema=DesignationExtractionResponse.model_json_schema()
-        )
-        
-        response = await self.client.aio.models.generate_content(
-            model=settings.GEMINI_FLASH_MODEL_NAME,
-            contents=contents,
-            config=generate_content_config,
-        )
-        
-        text_response = response.text
-        if not text_response:
-            raise Exception(f"Empty response from Gemini during designation extraction: {response}") 
-        
-        extraction_response = DesignationExtractionResponse.model_validate_json(text_response)
-        return {
-            "designations": [d.model_dump() for d in extraction_response.designations]
-        }
+            
+            response = await self.client.aio.models.generate_content(
+                model=settings.GEMINI_FLASH_MODEL_NAME,
+                contents=contents,
+                config=generate_content_config,
+            )
+
+            text_response = response.text
+            if not text_response:
+                logger.error("Empty response from Gemini during designation extraction")
+                raise Exception("Empty response from Gemini during designation extraction")
+            
+            extraction_response = DesignationExtractionResponse.model_validate_json(text_response)
+            return {
+                "designations": [d.model_dump() for d in extraction_response.designations]
+            }
+            
+        except Exception as e:
+            logger.exception("Designation extraction failed")  
+            raise Exception(f"Designation extraction failed: {str(e)}") from e
     
     async def _generate_frac_for_batch(
         self,
@@ -357,8 +354,6 @@ class RoleMappingService:
                 contents=contents,
                 config=generate_content_config,
             )
-
-            # logger.info(f"FRAC Batch {batch_number} Gemini usage: {response.usage_metadata}")
 
             text_response = response.text
             if not text_response:
@@ -599,6 +594,31 @@ class RoleMappingService:
         return frac_mappings
 
     async def generate_role_mapping(
+        self,
+        user_id: uuid.UUID,
+        org_type: OrgType,
+        state_center_id: str,
+        state_center_name: str,
+        department_name: Optional[str] = None,
+        department_id: Optional[str] = None,
+        instruction: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Wraps the two-pass (+PASS 3) generation in a Langfuse trace (no-op unless enabled),
+        so every LLM call in this run is grouped under one trace, filterable by user_id and
+        session_id (=<state_center_id>:<department_id>)."""
+        with tracing.trace(
+            name=f"role-mapping: {department_name or state_center_name}",
+            user_id=str(user_id),
+            session_id=f"{user_id}:{state_center_id}:{department_id or '-'}",
+            tags=[getattr(org_type, 'value', str(org_type)), "role-mapping"],
+            state_center_id=state_center_id, department_id=department_id,
+            department_name=department_name):
+            return await self._generate_role_mapping_impl(
+                user_id=user_id, org_type=org_type, state_center_id=state_center_id,
+                state_center_name=state_center_name, department_name=department_name,
+                department_id=department_id, instruction=instruction)
+
+    async def _generate_role_mapping_impl(
         self,
         user_id: uuid.UUID,
         org_type: OrgType,
