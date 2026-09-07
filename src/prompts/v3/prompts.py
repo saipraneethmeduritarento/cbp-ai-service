@@ -429,14 +429,42 @@ You will be provided with the following inputs:
 
 2.2.1. **Proficiency Level — SELECT EXACTLY ONE PER COMPETENCY**
 - Every KCM entry lists its levels under `proficiency_levels`, each with a `level` name (`Operational`, `Tactical`, `Strategic`), a short `label`, and a detailed `description`.
-- For each Behavioural/Functional competency you select, you MUST also output a `proficiency_level` — the ONE level that best matches what THIS designation actually needs.
-- **How to choose:** read each level's `label` and `description` and compare them against this designation's listed Role/Responsibilities and Activities. Pick the level whose described behaviours match the seniority and scope of the role's real work — not the highest available level.
-  - `Operational` — executes and applies; gathers, organises, follows established process. Typical of junior/field/clerical and execution-focused roles.
-  - `Tactical` — analyses, applies structured tools, coordinates teams, prioritises. Typical of middle-management and supervisory roles.
-  - `Strategic` — sets direction, anchors decisions in policy/national priorities, shapes long-term outcomes. Reserve for senior leadership (e.g. Secretary, Head of Department).
+- For each Behavioural/Functional competency you select, you MUST output exactly ONE `proficiency_level`.
+
+**How to determine the level — per competency, from the work itself:**
+Decide it as: **Role & Responsibilities + Activities → the competency behaviour actually required → level.**
+
+**PRIMARY inputs — the level is decided from these two:**
+1. **Role & Responsibilities** — accountability, decision-making authority, ownership, coordination and expected outcomes. Use these to judge the depth, complexity and autonomy at which the competency is needed.
+2. **Activities** — what the role actually does with this competency: executes, analyses, coordinates, supervises, decides, or sets direction.
+
+**SUPPORTING input — used only to interpret the two above, never decisive on its own:**
+3. **Designation context** — functional/administrative scope, authority and reporting context. It frames how to read the R&R and Activities; it NEVER sets the level by itself, and the title alone is never a reason for any level.
+
+Then compare that required behaviour against the `label` and `description` of EACH level in THIS competency's own `proficiency_levels`, and pick the closest match. The competency's own level descriptions are the authoritative definition of what each level means for that competency — match the substance of the work, not keywords.
+
+**Level meanings (general guidance — the competency's own descriptions always win):**
+- `Operational` — executes, applies, follows, gathers, organises or maintains using established processes and tools; defined scope, limited independent decision-making.
+- `Tactical` — analyses, plans, coordinates, supervises, prioritises, resolves issues or manages resources within a team, programme or functional scope; substantial independent judgement.
+- `Strategic` — sets direction, establishes frameworks or policy, makes high-impact decisions, shapes priorities and long-term outcomes, or connects decisions to institutional/state/national priorities.
+
+⚠️ **This is the most common error — read carefully:**
+- Assign the level from the ACTUAL WORK, never from the designation's title, rank or seniority. A senior designation MUST get `Operational` for a competency whose R&R and Activities only require execution or application of it. A junior or mid-level designation MUST get `Tactical` where its R&R and Activities genuinely involve analysis, coordination, prioritisation, supervision or independent judgement.
+- `Strategic` requires evidence of strategic responsibility in the R&R and Activities — seniority alone is NEVER sufficient.
+- **Judge each competency separately.** The level is a property of THIS competency for THIS role, not of the designation. Do NOT assign one blanket level across a designation's competencies: the same official is routinely `Strategic` on a competency they set direction for, `Tactical` on one they coordinate, and `Operational` on one they merely apply. A designation whose competencies all carry the same level is almost always wrong — re-check each one against the specific responsibilities and activities that need it.
+- Do not default to the highest level available, and do not use any single one of the three inputs (context, R&R, or Activities) on its own.
+
 - Output the `level` value EXACTLY as written in that competency's `proficiency_levels` (e.g. `Tactical`). Do NOT invent a level name, do NOT output the `label` or `description`, and do NOT output more than one level.
 - A competency only offers the levels listed in ITS OWN entry — never assign a level that is not in that entry's `proficiency_levels`.
 - (Domain competencies have NO proficiency level — omit `proficiency_level` for Domain.)
+
+**Justify every level — `proficiency_rationale` (REQUIRED for Behavioural & Functional):**
+- Alongside `proficiency_level`, output a `proficiency_rationale`: ONE short sentence (max ~30 words) stating WHY that level fits, so a reviewer can check the decision against the source.
+- It MUST name the specific Role/Responsibility or Activity of THIS designation that drove the choice, and say what that work requires of the competency.
+- Write it as evidence, not as a restatement of the level. ✅ "Reviews scheme proposals and recommends options to the Director — analysis and prioritisation, not direction-setting." ❌ "Tactical level is appropriate for this designation." ❌ "This is a senior role."
+- A rationale that cites only the designation's rank or title is INVALID — it must point at actual work.
+- If you cannot write such a sentence from the R&R and Activities, you have chosen the wrong level (or the wrong competency) — reconsider before outputting.
+- (Domain competencies have no proficiency level — omit `proficiency_rationale` for Domain.)
 
 2.2.2. **Delivery Mode — ONLINE vs OFFLINE**
 - For EVERY competency you output (Behavioural, Functional AND Domain), you MUST output a `delivery_mode` of either `Online` or `Offline`.
@@ -589,14 +617,42 @@ You will be provided with the following inputs:
 
 2.2.1. **Proficiency Level — SELECT EXACTLY ONE PER COMPETENCY**
 - Every KCM entry lists its levels under `proficiency_levels`, each with a `level` name (`Operational`, `Tactical`, `Strategic`), a short `label`, and a detailed `description`.
-- For each Behavioural/Functional competency you select, you MUST also output a `proficiency_level` — the ONE level that best matches what THIS designation actually needs.
-- **How to choose:** read each level's `label` and `description` and compare them against this designation's listed Role/Responsibilities and Activities. Pick the level whose described behaviours match the seniority and scope of the role's real work — not the highest available level.
-  - `Operational` — executes and applies; gathers, organises, follows established process. Typical of junior/field/clerical and execution-focused roles.
-  - `Tactical` — analyses, applies structured tools, coordinates teams, prioritises. Typical of middle-management and supervisory roles.
-  - `Strategic` — sets direction, anchors decisions in policy/national priorities, shapes long-term outcomes. Reserve for senior leadership (e.g. Secretary, Head of Department).
+- For each Behavioural/Functional competency you select, you MUST output exactly ONE `proficiency_level`.
+
+**How to determine the level — per competency, from the work itself:**
+Decide it as: **Role & Responsibilities + Activities → the competency behaviour actually required → level.**
+
+**PRIMARY inputs — the level is decided from these two:**
+1. **Role & Responsibilities** — accountability, decision-making authority, ownership, coordination and expected outcomes. Use these to judge the depth, complexity and autonomy at which the competency is needed.
+2. **Activities** — what the role actually does with this competency: executes, analyses, coordinates, supervises, decides, or sets direction.
+
+**SUPPORTING input — used only to interpret the two above, never decisive on its own:**
+3. **Designation context** — functional/administrative scope, authority and reporting context. It frames how to read the R&R and Activities; it NEVER sets the level by itself, and the title alone is never a reason for any level.
+
+Then compare that required behaviour against the `label` and `description` of EACH level in THIS competency's own `proficiency_levels`, and pick the closest match. The competency's own level descriptions are the authoritative definition of what each level means for that competency — match the substance of the work, not keywords.
+
+**Level meanings (general guidance — the competency's own descriptions always win):**
+- `Operational` — executes, applies, follows, gathers, organises or maintains using established processes and tools; defined scope, limited independent decision-making.
+- `Tactical` — analyses, plans, coordinates, supervises, prioritises, resolves issues or manages resources within a team, programme or functional scope; substantial independent judgement.
+- `Strategic` — sets direction, establishes frameworks or policy, makes high-impact decisions, shapes priorities and long-term outcomes, or connects decisions to institutional/state/national priorities.
+
+⚠️ **This is the most common error — read carefully:**
+- Assign the level from the ACTUAL WORK, never from the designation's title, rank or seniority. A senior designation MUST get `Operational` for a competency whose R&R and Activities only require execution or application of it. A junior or mid-level designation MUST get `Tactical` where its R&R and Activities genuinely involve analysis, coordination, prioritisation, supervision or independent judgement.
+- `Strategic` requires evidence of strategic responsibility in the R&R and Activities — seniority alone is NEVER sufficient.
+- **Judge each competency separately.** The level is a property of THIS competency for THIS role, not of the designation. Do NOT assign one blanket level across a designation's competencies: the same official is routinely `Strategic` on a competency they set direction for, `Tactical` on one they coordinate, and `Operational` on one they merely apply. A designation whose competencies all carry the same level is almost always wrong — re-check each one against the specific responsibilities and activities that need it.
+- Do not default to the highest level available, and do not use any single one of the three inputs (context, R&R, or Activities) on its own.
+
 - Output the `level` value EXACTLY as written in that competency's `proficiency_levels` (e.g. `Tactical`). Do NOT invent a level name, do NOT output the `label` or `description`, and do NOT output more than one level.
 - A competency only offers the levels listed in ITS OWN entry — never assign a level that is not in that entry's `proficiency_levels`.
 - (Domain competencies have NO proficiency level — omit `proficiency_level` for Domain.)
+
+**Justify every level — `proficiency_rationale` (REQUIRED for Behavioural & Functional):**
+- Alongside `proficiency_level`, output a `proficiency_rationale`: ONE short sentence (max ~30 words) stating WHY that level fits, so a reviewer can check the decision against the source.
+- It MUST name the specific Role/Responsibility or Activity of THIS designation that drove the choice, and say what that work requires of the competency.
+- Write it as evidence, not as a restatement of the level. ✅ "Reviews scheme proposals and recommends options to the Director — analysis and prioritisation, not direction-setting." ❌ "Tactical level is appropriate for this designation." ❌ "This is a senior role."
+- A rationale that cites only the designation's rank or title is INVALID — it must point at actual work.
+- If you cannot write such a sentence from the R&R and Activities, you have chosen the wrong level (or the wrong competency) — reconsider before outputting.
+- (Domain competencies have no proficiency level — omit `proficiency_rationale` for Domain.)
 
 2.2.2. **Delivery Mode — ONLINE vs OFFLINE**
 - For EVERY competency you output (Behavioural, Functional AND Domain), you MUST output a `delivery_mode` of either `Online` or `Offline`.

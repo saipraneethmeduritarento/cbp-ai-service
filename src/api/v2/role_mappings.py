@@ -31,6 +31,11 @@ router = APIRouter(tags=["Role Mappings"])
 with open("data/competencies.json") as f:
     COMPETENCY_MAPPING = json.load(f)
 
+# add-designation selects competencies by KCM id and picks a proficiency level, so it needs
+# the levelled KCM (same source of truth the v3 reconciliation below canonicalizes against).
+with open("data/competencies_level.json") as f:
+    COMPETENCY_MAPPING_WITH_LEVELS = json.load(f)
+
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = settings.GOOGLE_APPLICATION_CREDENTIALS
 client = genai.Client(
     project=settings.GOOGLE_PROJECT_ID,
@@ -261,9 +266,13 @@ async def generate_role_and_competencies(input_data):
             "activities": "[List of Activities]",
             "competencies": [
                 {
+                    "competency_id": "[KCM id e.g. BEH-007 / FUN-045 — REQUIRED for Behavioural & Functional; omit for Domain]",
                     "type": "[Behavioural/Functional/Domain]",
                     "theme": "[Competency Theme]",
                     "sub_theme": "[Competency Sub-theme]",
+                    "proficiency_level": "[Operational/Tactical/Strategic — REQUIRED for Behavioural & Functional; omit for Domain]",
+                    "proficiency_rationale": "[one short sentence citing the R&R/Activity that justifies the level — REQUIRED for Behavioural & Functional; omit for Domain]",
+                    "delivery_mode": "[Online/Offline]",
                 }
             ],
             "source": "[Primary document summaries, KCM, AI Suggested]"
@@ -275,7 +284,7 @@ async def generate_role_and_competencies(input_data):
             sector=input_data.get('sector_name', 'N/A'),
             instructions=input_data.get('instruction'),
             primary_summary=docs_summary or 'N/A',
-            kcm_competencies=json.dumps(COMPETENCY_MAPPING, indent=2),
+            kcm_competencies=json.dumps(COMPETENCY_MAPPING_WITH_LEVELS, indent=2),
             output_json_format=json.dumps(output_json_format, indent=None, separators=(',', ':'))
         )
 
@@ -285,7 +294,7 @@ async def generate_role_and_competencies(input_data):
             #     types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="OFF")
             # ],
             response_mime_type="application/json",
-            response_schema={"type":"OBJECT","properties":{"designation_name":{"type":"STRING","description":"The official designation or job title for the role."},"wing_division_section":{"type":"STRING","description":"The organizational unit (wing, division, or section) where the role is situated."},"role_responsibilities":{"type":"ARRAY","items":{"type":"STRING"},"description":"A list of 5-8 concise, action-oriented role responsibilities."},"activities":{"type":"ARRAY","items":{"type":"STRING"},"description":"A list of 5–8 activities or tasks aligned to the role responsibilities."},"competencies":{"type":"ARRAY","items":{"type":"OBJECT","properties":{"type":{"type":"STRING","enum":["Behavioural","Functional","Domain"],"description":"The category of competency as per Karmayogi framework."},"theme":{"type":"STRING","description":"The parent theme of the competency (must come from dataset)."},"sub_theme":{"type":"STRING","description":"The sub-theme of the competency (must come from dataset)."}},"required":["type","theme","sub_theme"]},"description":"A list of competencies relevant to the role. Must include at least one Behavioural, one Functional, and one Domain competency."}},"required":["designation_name","wing_division_section","role_responsibilities","activities","competencies"]},
+            response_schema={"type":"OBJECT","properties":{"designation_name":{"type":"STRING","description":"The official designation or job title for the role."},"wing_division_section":{"type":"STRING","description":"The organizational unit (wing, division, or section) where the role is situated."},"role_responsibilities":{"type":"ARRAY","items":{"type":"STRING"},"description":"A list of 5-8 concise, action-oriented role responsibilities."},"activities":{"type":"ARRAY","items":{"type":"STRING"},"description":"A list of 5–8 activities or tasks aligned to the role responsibilities."},"competencies":{"type":"ARRAY","items":{"type":"OBJECT","properties":{"competency_id":{"type":"STRING","nullable":True,"description":"KCM competency id (e.g. BEH-007 / FUN-045). REQUIRED for Behavioural & Functional; omit for Domain."},"type":{"type":"STRING","enum":["Behavioural","Functional","Domain"],"description":"The category of competency as per Karmayogi framework."},"theme":{"type":"STRING","description":"The parent theme of the competency (must come from dataset)."},"sub_theme":{"type":"STRING","description":"The sub-theme of the competency (must come from dataset)."},"proficiency_level":{"type":"STRING","nullable":True,"description":"The single best-fit proficiency level for this designation, selected from the competency's proficiency_levels (Operational, Tactical or Strategic). REQUIRED for Behavioural & Functional; omit for Domain."},"proficiency_rationale":{"type":"STRING","nullable":True,"description":"One short sentence naming the specific Role/Responsibility or Activity of this designation that justifies the chosen proficiency_level. REQUIRED for Behavioural & Functional; omit for Domain."},"delivery_mode":{"type":"STRING","enum":["Online","Offline"],"description":"Whether this competency's sub-theme is best learned Online (knowledge-based, self-paced) or Offline (practice/interaction-based) for this designation."}},"required":["type","theme","sub_theme","delivery_mode"]},"description":"A list of competencies relevant to the role. Must include at least one Behavioural, one Functional, and one Domain competency."}},"required":["designation_name","wing_division_section","role_responsibilities","activities","competencies"]},
         )
 
         contents = [   
