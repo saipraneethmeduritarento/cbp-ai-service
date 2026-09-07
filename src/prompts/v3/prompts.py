@@ -427,6 +427,25 @@ You will be provided with the following inputs:
 - Do NOT use your general knowledge to generate Behavioural or Functional competencies — the KCM Dataset is the only permitted source.
 - (Domain competencies have NO `competency_id` — leave that field out for Domain.)
 
+2.2.1. **Proficiency Level — SELECT EXACTLY ONE PER COMPETENCY**
+- Every KCM entry lists its levels under `proficiency_levels`, each with a `level` name (`Operational`, `Tactical`, `Strategic`), a short `label`, and a detailed `description`.
+- For each Behavioural/Functional competency you select, you MUST also output a `proficiency_level` — the ONE level that best matches what THIS designation actually needs.
+- **How to choose:** read each level's `label` and `description` and compare them against this designation's listed Role/Responsibilities and Activities. Pick the level whose described behaviours match the seniority and scope of the role's real work — not the highest available level.
+  - `Operational` — executes and applies; gathers, organises, follows established process. Typical of junior/field/clerical and execution-focused roles.
+  - `Tactical` — analyses, applies structured tools, coordinates teams, prioritises. Typical of middle-management and supervisory roles.
+  - `Strategic` — sets direction, anchors decisions in policy/national priorities, shapes long-term outcomes. Reserve for senior leadership (e.g. Secretary, Head of Department).
+- Output the `level` value EXACTLY as written in that competency's `proficiency_levels` (e.g. `Tactical`). Do NOT invent a level name, do NOT output the `label` or `description`, and do NOT output more than one level.
+- A competency only offers the levels listed in ITS OWN entry — never assign a level that is not in that entry's `proficiency_levels`.
+- (Domain competencies have NO proficiency level — omit `proficiency_level` for Domain.)
+
+2.2.2. **Delivery Mode — ONLINE vs OFFLINE**
+- For EVERY competency you output (Behavioural, Functional AND Domain), you MUST output a `delivery_mode` of either `Online` or `Offline`.
+- This answers: how is this competency's **sub-theme** best learned by THIS designation?
+  - `Online` — knowledge-, rule-, or theory-based learning that transfers well through self-paced digital courses, reading, and e-modules. Typical of factual/procedural sub-themes: acts and rules, schemes and policies, financial procedures, digital tools, data concepts, domain knowledge.
+  - `Offline` — skill-, behaviour-, or practice-based learning that needs live interaction, practice with feedback, role-play, group work, mentoring, or field exposure. Typical of interpersonal and applied sub-themes: verbal communication, negotiation, conflict handling, team leadership, empathy, public/citizen interaction, hands-on field techniques.
+- **Judge the sub-theme first, then the role.** Base the decision primarily on the nature of the `sub_theme` (and its `sub_theme_description`), then adjust for how this designation would realistically use it. Example: "Verbal & Non-Verbal Fluency" is practice-and-feedback based → `Offline`; "Rule of Business (AoB/ToB)" is rule-based knowledge → `Online`.
+- Be consistent: the same sub-theme should generally get the same `delivery_mode` across designations unless the role genuinely changes how it must be learned.
+
 **Relevance guardrails — pick for THIS role, not just any valid entry:**
 - **Ground every pick.** Select a Behavioural/Functional competency ONLY if you can tie it to a specific listed Role/Responsibility or Activity of THIS designation. Silently ask yourself "which duty of this role needs this competency?" — if you cannot answer, do NOT select it. A valid KCM entry that is irrelevant to the role is still a WRONG selection.
 - **Do not pad to a count.** Choose the most relevant entries first. Aim for at least the minimum, but NEVER add a clearly-irrelevant competency just to reach the minimum or approach the maximum. Fewer, genuinely-relevant competencies are better than padded ones.
@@ -458,7 +477,8 @@ You will be provided with the following inputs:
 ⚠️ CRITICAL OUTPUT FORMAT RULES — VIOLATIONS WILL CAUSE SYSTEM FAILURE:
 1. `competencies` MUST be a **flat JSON array** of objects. Do NOT group by type. The following structure is STRICTLY FORBIDDEN:
    {{"behavioural": [...], "functional": [...], "domain": [...]}}
-   The ONLY valid structure is: [{{"competency_id": "BEH-007", "type": "Behavioural", "theme": "...", "sub_theme": "..."}}, ...]  (competency_id required for Behavioural/Functional; omit it for Domain)
+   The ONLY valid structure is: [{{"competency_id": "BEH-007", "type": "Behavioural", "theme": "...", "sub_theme": "...", "proficiency_level": "Tactical", "delivery_mode": "Offline"}}, ...]
+   (`competency_id` and `proficiency_level` are required for Behavioural/Functional and omitted for Domain; `delivery_mode` is required for EVERY competency including Domain)
 2. `role_responsibilities` MUST be a **flat array of strings** at the top level of each object. Do NOT nest it inside roles or any other key.
 3. `activities` MUST be a **flat array of strings** at the top level of each object. Do NOT nest it inside roles or any other key.
 4. These rules apply to EVERY object in the output array — including lower-rank and support staff designations.
@@ -480,9 +500,13 @@ Field usage:
 - `theme`: The competency theme name — copy from the SAME entry as the `competency_id`.
 - `theme_description`: What the theme means — use this to judge whether the theme is relevant to the designation's overall role. Do NOT output this field.
 - `sub_theme`: The competency sub-theme name — copy from the SAME entry as the `competency_id`.
-- `sub_theme_description`: What the sub-theme means — use this to judge whether it fits the designation's specific activities. Do NOT output this field.
+- `sub_theme_description`: What the sub-theme means — use this to judge whether it fits the designation's specific activities, and to decide `delivery_mode`. Do NOT output this field.
+- `proficiency_levels`: The levels this competency defines. Each has:
+    - `level` — the level name (`Operational`, `Tactical`, `Strategic`). **Select exactly ONE per competency and output it as `proficiency_level`.**
+    - `label` — a one-line summary of what that level looks like in practice. Use it to judge fit. Do NOT output this field.
+    - `description` — the detailed behaviours expected at that level. Use it to judge fit against the designation's responsibilities and activities. Do NOT output this field.
 
-Selection process: For each designation, read the `theme_description` and `sub_theme_description` of candidate entries to assess fit against the designation's actual roles and activities. Only select entries where the description genuinely matches the role context. Output the chosen entry's `competency_id` and copy its `type`, `theme`, and `sub_theme` verbatim from that one entry — no paraphrasing, no renaming, no mixing fields across entries.
+Selection process: For each designation, read the `theme_description` and `sub_theme_description` of candidate entries to assess fit against the designation's actual roles and activities. Only select entries where the description genuinely matches the role context. Output the chosen entry's `competency_id` and copy its `type`, `theme`, and `sub_theme` verbatim from that one entry — no paraphrasing, no renaming, no mixing fields across entries. Then read that entry's `proficiency_levels` and output the ONE `level` whose `label`/`description` matches the seniority and scope of this designation's work, plus a `delivery_mode` of `Online` or `Offline` based on how that sub-theme is best learned.
 
 {kcm_competencies}
 
@@ -563,6 +587,25 @@ You will be provided with the following inputs:
 - Do NOT use your general knowledge to generate Behavioural or Functional competencies — the KCM Dataset is the only permitted source.
 - (Domain competencies have NO `competency_id` — leave that field out for Domain.)
 
+2.2.1. **Proficiency Level — SELECT EXACTLY ONE PER COMPETENCY**
+- Every KCM entry lists its levels under `proficiency_levels`, each with a `level` name (`Operational`, `Tactical`, `Strategic`), a short `label`, and a detailed `description`.
+- For each Behavioural/Functional competency you select, you MUST also output a `proficiency_level` — the ONE level that best matches what THIS designation actually needs.
+- **How to choose:** read each level's `label` and `description` and compare them against this designation's listed Role/Responsibilities and Activities. Pick the level whose described behaviours match the seniority and scope of the role's real work — not the highest available level.
+  - `Operational` — executes and applies; gathers, organises, follows established process. Typical of junior/field/clerical and execution-focused roles.
+  - `Tactical` — analyses, applies structured tools, coordinates teams, prioritises. Typical of middle-management and supervisory roles.
+  - `Strategic` — sets direction, anchors decisions in policy/national priorities, shapes long-term outcomes. Reserve for senior leadership (e.g. Secretary, Head of Department).
+- Output the `level` value EXACTLY as written in that competency's `proficiency_levels` (e.g. `Tactical`). Do NOT invent a level name, do NOT output the `label` or `description`, and do NOT output more than one level.
+- A competency only offers the levels listed in ITS OWN entry — never assign a level that is not in that entry's `proficiency_levels`.
+- (Domain competencies have NO proficiency level — omit `proficiency_level` for Domain.)
+
+2.2.2. **Delivery Mode — ONLINE vs OFFLINE**
+- For EVERY competency you output (Behavioural, Functional AND Domain), you MUST output a `delivery_mode` of either `Online` or `Offline`.
+- This answers: how is this competency's **sub-theme** best learned by THIS designation?
+  - `Online` — knowledge-, rule-, or theory-based learning that transfers well through self-paced digital courses, reading, and e-modules. Typical of factual/procedural sub-themes: acts and rules, schemes and policies, financial procedures, digital tools, data concepts, domain knowledge.
+  - `Offline` — skill-, behaviour-, or practice-based learning that needs live interaction, practice with feedback, role-play, group work, mentoring, or field exposure. Typical of interpersonal and applied sub-themes: verbal communication, negotiation, conflict handling, team leadership, empathy, public/citizen interaction, hands-on field techniques.
+- **Judge the sub-theme first, then the role.** Base the decision primarily on the nature of the `sub_theme` (and its `sub_theme_description`), then adjust for how this designation would realistically use it. Example: "Verbal & Non-Verbal Fluency" is practice-and-feedback based → `Offline`; "Rule of Business (AoB/ToB)" is rule-based knowledge → `Online`.
+- Be consistent: the same sub-theme should generally get the same `delivery_mode` across designations unless the role genuinely changes how it must be learned.
+
 **Relevance guardrails — pick for THIS role, not just any valid entry:**
 - **Ground every pick.** Select a Behavioural/Functional competency ONLY if you can tie it to a specific listed Role/Responsibility or Activity of THIS designation. Silently ask yourself "which duty of this role needs this competency?" — if you cannot answer, do NOT select it. A valid KCM entry that is irrelevant to the role is still a WRONG selection.
 - **Do not pad to a count.** Choose the most relevant entries first. Aim for at least the minimum, but NEVER add a clearly-irrelevant competency just to reach the minimum or approach the maximum. Fewer, genuinely-relevant competencies are better than padded ones.
@@ -602,7 +645,8 @@ You will be provided with the following inputs:
 ⚠️ CRITICAL OUTPUT FORMAT RULES — VIOLATIONS WILL CAUSE SYSTEM FAILURE:
 1. `competencies` MUST be a **flat JSON array** of objects. Do NOT group by type. The following structure is STRICTLY FORBIDDEN:
    {{"behavioural": [...], "functional": [...], "domain": [...]}}
-   The ONLY valid structure is: [{{"competency_id": "BEH-007", "type": "Behavioural", "theme": "...", "sub_theme": "..."}}, ...]  (competency_id required for Behavioural/Functional; omit it for Domain)
+   The ONLY valid structure is: [{{"competency_id": "BEH-007", "type": "Behavioural", "theme": "...", "sub_theme": "...", "proficiency_level": "Tactical", "delivery_mode": "Offline"}}, ...]
+   (`competency_id` and `proficiency_level` are required for Behavioural/Functional and omitted for Domain; `delivery_mode` is required for EVERY competency including Domain)
 2. `role_responsibilities` MUST be a **flat array of strings** at the top level of each object. Do NOT nest it inside roles or any other key.
 3. `activities` MUST be a **flat array of strings** at the top level of each object. Do NOT nest it inside roles or any other key.
 4. These rules apply to EVERY object in the output array — including lower-rank and support staff designations.
@@ -624,9 +668,13 @@ Field usage:
 - `theme`: The competency theme name — copy from the SAME entry as the `competency_id`.
 - `theme_description`: What the theme means — use this to judge whether the theme is relevant to the designation's overall role. Do NOT output this field.
 - `sub_theme`: The competency sub-theme name — copy from the SAME entry as the `competency_id`.
-- `sub_theme_description`: What the sub-theme means — use this to judge whether it fits the designation's specific activities. Do NOT output this field.
+- `sub_theme_description`: What the sub-theme means — use this to judge whether it fits the designation's specific activities, and to decide `delivery_mode`. Do NOT output this field.
+- `proficiency_levels`: The levels this competency defines. Each has:
+    - `level` — the level name (`Operational`, `Tactical`, `Strategic`). **Select exactly ONE per competency and output it as `proficiency_level`.**
+    - `label` — a one-line summary of what that level looks like in practice. Use it to judge fit. Do NOT output this field.
+    - `description` — the detailed behaviours expected at that level. Use it to judge fit against the designation's responsibilities and activities. Do NOT output this field.
 
-Selection process: For each designation, read the `theme_description` and `sub_theme_description` of candidate entries to assess fit against the designation's actual roles and activities. Only select entries where the description genuinely matches the role context. Output the chosen entry's `competency_id` and copy its `type`, `theme`, and `sub_theme` verbatim from that one entry — no paraphrasing, no renaming, no mixing fields across entries.
+Selection process: For each designation, read the `theme_description` and `sub_theme_description` of candidate entries to assess fit against the designation's actual roles and activities. Only select entries where the description genuinely matches the role context. Output the chosen entry's `competency_id` and copy its `type`, `theme`, and `sub_theme` verbatim from that one entry — no paraphrasing, no renaming, no mixing fields across entries. Then read that entry's `proficiency_levels` and output the ONE `level` whose `label`/`description` matches the seniority and scope of this designation's work, plus a `delivery_mode` of `Online` or `Offline` based on how that sub-theme is best learned.
 
 {kcm_competencies}
 

@@ -19,6 +19,9 @@ class Competency(BaseModel):
     type: str = Field(..., description="Type of competency (Behavioral, Functional, Domain)")
     theme: str = Field(..., description="Theme of the competency")
     sub_theme: str = Field(..., description="Sub-theme of the competency")
+    competency_id: Optional[str] = Field(None, description="KCM competency id (e.g. BEH-007); absent for Domain competencies")
+    proficiency_level: Optional[str] = Field(None, description="Best-fit proficiency level for this designation (Operational, Tactical, Strategic); absent for Domain competencies")
+    delivery_mode: Optional[str] = Field(None, description="How this competency is best learned (Online or Offline)")
 
 class RoleMappingBase(BaseModel):
     """Base schema for Role Mapping"""
