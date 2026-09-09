@@ -18,10 +18,14 @@ from ...crud.document import crud_document
 from ...core.logger import logger
 from ...core import tracing
 
-with open("data/withidentifier_competencies.json") as f:
+with open("data/competencies_level.json") as f:
     COMPETENCY_MAPPING = json.load(f)
 
-# Deterministic KCM canonicalization index (id -> exact {type, theme, sub_theme}).
+# Valid delivery modes the LLM may suggest for a competency (how it is best learned).
+DELIVERY_MODES = ("Online", "Offline")
+
+# Deterministic KCM canonicalization index (id -> exact {type, theme, sub_theme} plus the
+# competency's valid proficiency levels).
 # The LLM selects a `competency_id`; the server rebuilds the authoritative name from
 # this table, so a Behavioural/Functional competency can never be mixed, type-swapped,
 # renamed, or invented outside KCM. Domain competencies are outside KCM and untouched.
@@ -31,6 +35,13 @@ KCM_BY_ID = {
         "type": e["type"],
         "theme": e["theme"],
         "sub_theme": e["sub_theme"],
+        # {casefolded level -> canonical level} so an LLM-suggested level is validated
+        # against the levels this specific competency actually defines.
+        "levels": {
+            lvl["level"].casefold(): lvl["level"]
+            for lvl in (e.get("proficiency_levels") or [])
+            if lvl.get("level")
+        },
     }
     for e in COMPETENCY_MAPPING
 }
@@ -159,10 +170,13 @@ center_json_output = {
         "sort_order": "integer",
         "competencies": [
             {
-                "competency_id": "KCM id e.g. BEH-07 / FUN-23 (REQUIRED for Behavioural & Functional; omit for Domain)",
+                "competency_id": "KCM id e.g. BEH-007 / FUN-045 (REQUIRED for Behavioural & Functional; omit for Domain)",
                 "type": "Behavioural | Functional | Domain",
                 "theme": "string",
-                "sub_theme": "string"
+                "sub_theme": "string",
+                "proficiency_level": "Operational | Tactical | Strategic (REQUIRED for Behavioural & Functional; omit for Domain)",
+                "proficiency_rationale": "one short sentence citing the R&R/Activity that justifies the level (REQUIRED for Behavioural & Functional; omit for Domain)",
+                "delivery_mode": "Online | Offline"
             }
         ],
         "source": ["ACBP", "Work Allocation Order", "AI Suggested"]
@@ -178,10 +192,13 @@ state_json_output = {
         "sort_order": "integer",
         "competencies": [
             {
-                "competency_id": "KCM id e.g. BEH-07 / FUN-23 (REQUIRED for Behavioural & Functional; omit for Domain)",
+                "competency_id": "KCM id e.g. BEH-007 / FUN-045 (REQUIRED for Behavioural & Functional; omit for Domain)",
                 "type": "Behavioural | Functional | Domain",
                 "theme": "string",
-                "sub_theme": "string"
+                "sub_theme": "string",
+                "proficiency_level": "Operational | Tactical | Strategic (REQUIRED for Behavioural & Functional; omit for Domain)",
+                "proficiency_rationale": "one short sentence citing the R&R/Activity that justifies the level (REQUIRED for Behavioural & Functional; omit for Domain)",
+                "delivery_mode": "Online | Offline"
             }
         ],
         "source": ["Work Allocation Order", "ACBP", "Additional supporting document", "AI Suggested"]
@@ -202,10 +219,13 @@ class DesignationExtractionResponse(BaseModel):
         description="List of extracted unique designations sorted by hierarchy"
     )
 class FRACCompetency(BaseModel):
-    competency_id: Optional[str] = Field(default=None, description="KCM competency id (e.g. BEH-07 / FUN-23). REQUIRED for Behavioural & Functional; omit for Domain.")
+    competency_id: Optional[str] = Field(default=None, description="KCM competency id (e.g. BEH-007 / FUN-045). REQUIRED for Behavioural & Functional; omit for Domain.")
     type: Literal["Behavioural", "Functional", "Domain"] = Field(description="Competency type: Behavioural, Functional, or Domain")
     theme: str = Field(description="Competency theme")
     sub_theme: str = Field(description="Competency sub theme")
+    proficiency_level: Optional[str] = Field(default=None, description="The single best-fit proficiency level for THIS designation, selected from the competency's proficiency_levels (Operational, Tactical or Strategic). REQUIRED for Behavioural & Functional; omit for Domain.")
+    proficiency_rationale: Optional[str] = Field(default=None, description="One short sentence naming the specific Role/Responsibility or Activity of this designation that justifies the chosen proficiency_level. REQUIRED for Behavioural & Functional; omit for Domain.")
+    delivery_mode: Literal["Online", "Offline"] = Field(description="Whether this competency's sub-theme is best learned Online (knowledge-based, self-paced) or Offline (practice/interaction-based) for this designation")
     
 class FRACRoleMapping(BaseModel):
     designation_name: str = Field(description="Official designation name")
@@ -477,6 +497,33 @@ class RoleMappingService:
             return "Functional"
         return "Domain"
 
+    def _resolve_delivery_mode(self, competency: Dict[str, Any], metrics: Dict[str, Any]) -> str:
+        """Normalize the LLM's delivery_mode to exactly 'Online' or 'Offline'.
+
+        Defaults to 'Online' when missing or unrecognised so the field is always populated;
+        the fallback is counted so a model that stops emitting it is visible in the logs.
+        """
+        raw = (competency.get("delivery_mode") or "").strip().casefold()
+        for mode in DELIVERY_MODES:
+            if raw == mode.casefold():
+                return mode
+        metrics["bad_delivery_mode"] += 1
+        return "Online"
+
+    def _resolve_proficiency_level(
+        self, competency: Dict[str, Any], canon: Dict[str, Any], metrics: Dict[str, Any]
+    ) -> Optional[str]:
+        """Snap the LLM's proficiency_level to a level this competency actually defines.
+
+        Returns None (rather than guessing a level) when the model omitted it or named one
+        outside the competency's own proficiency_levels, so bad data is visible as absent.
+        """
+        raw = (competency.get("proficiency_level") or "").strip()
+        level = canon["levels"].get(raw.casefold())
+        if level is None:
+            metrics["bad_level"] += 1
+        return level
+
     def _reconcile_competency_against_kcm( self, raw_competencies: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Snap every Behavioural/Functional competency back to its exact KCM entry.
 
@@ -487,6 +534,11 @@ class RoleMappingService:
         4. none -> DROP (out-of-KCM hallucination) and record it.
         Domain competencies pass through unchanged. Duplicates (same canonical id) are removed.
 
+        `proficiency_level` is validated against the levels the resolved competency actually
+        defines (case-tolerant, snapped to KCM spelling); an unknown/missing level is kept as
+        None rather than guessed. `delivery_mode` is normalized to Online/Offline, defaulting
+        to Online when the model omits it or emits something else.
+
         Returns {"competencies": [...canonical...], "metrics": {...}} where metrics measure
         what the OLD (name-copy) system would have leaked: name/type/id mismatches and drops.
         """
@@ -496,13 +548,17 @@ class RoleMappingService:
             "bf_total": 0, "resolved": 0, "dropped": 0,
             "name_mismatch": 0, "type_mismatch": 0, "id_missing_or_bad": 0,
             "clean": 0,            # LLM emitted a valid id AND echoed type/theme/sub exactly (no LLM error)
+            "bad_level": 0,        # LLM omitted the proficiency level or named one this competency lacks
+            "bad_delivery_mode": 0,  # LLM omitted delivery_mode or emitted a value outside Online/Offline
             "dropped_items": [],
             "records": [],         # per-competency raw-LLM-output vs canonical decision (for the hallucination report)
         }
         for c in (raw_competencies or []):
             ctype = self._norm_type(c.get("type", ""))
             if ctype == "Domain":
-                kept.append({k: v for k, v in c.items() if k != "competency_id"})
+                domain = {k: v for k, v in c.items() if k not in ("competency_id", "proficiency_level")}
+                domain["delivery_mode"] = self._resolve_delivery_mode(c, metrics)
+                kept.append(domain)
                 continue
             metrics["bf_total"] += 1
             llm_id = (c.get("competency_id") or "").strip()
@@ -560,7 +616,15 @@ class RoleMappingService:
                 continue
             seen_ids.add(cid)
             metrics["resolved"] += 1
-            out = {"type": canon["type"], "theme": canon["theme"], "sub_theme": canon["sub_theme"], "competency_id": cid}
+            out = {
+                "type": canon["type"],
+                "theme": canon["theme"],
+                "sub_theme": canon["sub_theme"],
+                "competency_id": cid,
+                "proficiency_level": self._resolve_proficiency_level(c, canon, metrics),
+                "proficiency_rationale": (c.get("proficiency_rationale") or "").strip() or None,
+                "delivery_mode": self._resolve_delivery_mode(c, metrics),
+            }
             if c.get("source") is not None:
                 out["source"] = c["source"]
             kept.append(out)
@@ -579,7 +643,8 @@ class RoleMappingService:
         # Deterministic KCM canonicalization: snap every Behavioural/Functional
         # competency back to its exact KCM entry by id (drops out-of-KCM items,
         # corrects swapped types, restores altered names). Domain is untouched.
-        agg = {"bf_total": 0, "resolved": 0, "dropped": 0, "name_mismatch": 0, "type_mismatch": 0, "id_missing_or_bad": 0, "clean": 0}
+        agg = {"bf_total": 0, "resolved": 0, "dropped": 0, "name_mismatch": 0, "type_mismatch": 0,
+               "id_missing_or_bad": 0, "clean": 0, "bad_level": 0, "bad_delivery_mode": 0}
         for mapping in frac_mappings:
             result = self._reconcile_competency_against_kcm(mapping.get("competencies", []))
             mapping["competencies"] = result["competencies"]
@@ -591,7 +656,8 @@ class RoleMappingService:
         logger.info(
             f"KCM canonicalization — B/F={agg['bf_total']} clean(LLM-correct)={agg['clean']} "
             f"resolved={agg['resolved']} dropped={agg['dropped']} name_mismatch={agg['name_mismatch']} "
-            f"type_mismatch={agg['type_mismatch']} bad_id={agg['id_missing_or_bad']}"
+            f"type_mismatch={agg['type_mismatch']} bad_id={agg['id_missing_or_bad']} "
+            f"bad_level={agg['bad_level']} bad_delivery_mode={agg['bad_delivery_mode']}"
         )
 
         # DB persists the US spelling "Behavioral" even though the KCM dataset and all
@@ -710,6 +776,13 @@ class RoleMappingService:
                 organization_data_pass2,
                 batch_size=settings.ROLE_MAPPING_BATCH_SIZE
             )
+            if not frac_mappings:
+                # Every batch swallowed its own exception and returned []; without this the
+                # caller would treat a total PASS 2 failure as a successful empty result.
+                raise Exception(
+                    f"No FRAC mappings generated in PASS 2 for {len(designations)} designations; "
+                    "see per-batch errors above"
+                )
 
             # ============ PASS 3: KCM RECONCILIATION (Behavioural/Functional only) ============
             # Cross-verify every Behavioural/Functional competency against data/competencies.json,
