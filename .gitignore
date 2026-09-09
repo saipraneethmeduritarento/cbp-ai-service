@@ -214,3 +214,4 @@ curl
 .vscode/
 
 *.csv
+sql/

@@ -270,7 +270,17 @@ class RoleMappingService:
                         )
                 )]
             )
-            
+        ]
+
+        generate_content_config = types.GenerateContentConfig(
+            system_instruction=DESIGNATION_EXTRACTION_PROMPT,
+            temperature=0.1,   # Very low — factual extraction, no creativity
+            top_p=0.85, # Restrict to high-probability tokens
+            response_mime_type="application/json",
+            response_schema=DesignationExtractionResponse.model_json_schema()
+        )
+
+        try:
             response = await self.client.aio.models.generate_content(
                 model=settings.GEMINI_FLASH_MODEL_NAME,
                 contents=contents,
@@ -281,12 +291,12 @@ class RoleMappingService:
             if not text_response:
                 logger.error("Empty response from Gemini during designation extraction")
                 raise Exception("Empty response from Gemini during designation extraction")
-            
+
             extraction_response = DesignationExtractionResponse.model_validate_json(text_response)
             return {
                 "designations": [d.model_dump() for d in extraction_response.designations]
             }
-            
+
         except Exception as e:
             logger.exception("Designation extraction failed")  
             raise Exception(f"Designation extraction failed: {str(e)}") from e
