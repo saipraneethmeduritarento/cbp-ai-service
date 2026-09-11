@@ -646,6 +646,9 @@ log at `bulk_scripts/logs/bulk_training_plan_approval_<timestamp>.log`.
 - The plan name is built as "AI CBP for `<designation>`" — it uses the iGOT designation name if one
   is set on the request's item, and only falls back to the plain designation name when there's no
   iGOT name.
+- The create call also sends `planYear` — a financial-year string (e.g. `"2026-27"`) passed as-is
+  from the mandatory `--plan-year` flag. It's independent of `due_date`/`--due-date` and applied to
+  every row in the run; there's no per-row `plan_year` column.
 - Plan names longer than 70 characters are silently cut short — two long, similar designation names
   could end up looking identical in the published plan list.
 - Sending the "approved" notification email is best-effort, same as script 5 — a row can show
@@ -658,13 +661,13 @@ log at `bulk_scripts/logs/bulk_training_plan_approval_<timestamp>.log`.
 
 ```bash
 # 1. Dry run
-python bulk_scripts/bulk_training_plan_approval.py --excel <path/to/plans.xlsx> --user-id <uuid> --due-date 2027-03-31
+python bulk_scripts/bulk_training_plan_approval.py --excel <path/to/plans.xlsx> --user-id <uuid> --due-date 2027-03-31 --plan-year 2026-27
 
 # 2. Execute
-python bulk_scripts/bulk_training_plan_approval.py --excel <path/to/plans.xlsx> --user-id <uuid> --due-date 2027-03-31 --execute
+python bulk_scripts/bulk_training_plan_approval.py --excel <path/to/plans.xlsx> --user-id <uuid> --due-date 2027-03-31 --plan-year 2026-27 --execute
 
 # 3. Execute with a specific batch size (default 10)
-python bulk_scripts/bulk_training_plan_approval.py --excel <path/to/plans.xlsx> --user-id <uuid> --due-date 2027-03-31 --execute --batch-size 20
+python bulk_scripts/bulk_training_plan_approval.py --excel <path/to/plans.xlsx> --user-id <uuid> --due-date 2027-03-31 --plan-year 2026-27 --execute --batch-size 20
 ```
 
 ---
