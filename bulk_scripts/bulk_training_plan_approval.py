@@ -51,11 +51,12 @@ still published exactly the same, just without the email.
 
 cbp_plan_name / due_date / plan_year are REQUIRED by the iGOT create + the mdo_approval row. --due-date
 is a mandatory CLI arg (the default for rows without their own due_date column). --plan-year is a
-mandatory CLI arg (the financial-year string, e.g. "2026-27", sent as-is to every row's iGOT create
-call -- there is no per-row plan_year column). cbp_plan_name is prepared at REQUEST LEVEL ONLY (never
-from the input row): "AI CBP for <designation>", using the request's own designation (each
-approval_request is for exactly one designation) -- a request with no items to derive a designation
-from is FAILED (no iGOT call is made with a missing name).
+mandatory CLI arg (the financial-year string, e.g. "2026-27", validated as YYYY-YY with consecutive
+years). It's sent as-is to every row's iGOT create call and saved to mdo_approval.plan_year on each
+published item. There is no per-row plan_year column in the input file. cbp_plan_name is prepared at
+REQUEST LEVEL ONLY (never from the input row): "AI CBP for <designation>", using the request's own
+designation (each approval_request is for exactly one designation) -- a request with no items to derive
+a designation from is FAILED (no iGOT call is made with a missing name).
 
 RETRY: transient iGOT failures (network/timeout, HTTP 429/500/502/503/504) are retried with exponential
 backoff (--max-retries). A publish that permanently fails leaves the item AND its request PENDING and
@@ -92,6 +93,7 @@ import enum
 import json
 import logging
 import os
+import re
 import sys
 import time
 import uuid
@@ -300,6 +302,7 @@ class MdoApproval(Base):
     approval_request_item_id = Column(PgUUID(as_uuid=True), ForeignKey("approval_request_items.id"))
     plan_name = Column(String)
     due_date = Column(DateTime(timezone=True))
+    plan_year = Column(String(10))
     igot_cbp_plan_id = Column(PgUUID(as_uuid=True))
     created_at = Column(DateTime(timezone=True))
 
@@ -445,6 +448,20 @@ def normalize_due_date(value):
         pass
     dt = datetime.strptime(s, "%Y-%m-%d")
     return dt.replace(tzinfo=timezone.utc).isoformat()
+
+
+PLAN_YEAR_PATTERN = re.compile(r"^\d{4}-\d{2}$")
+
+
+def validate_plan_year(value):
+    """Same rules as the MDO service's ApproveRequestBody.plan_year: YYYY-YY and consecutive years.
+    Returns the value unchanged; raises ValueError otherwise."""
+    if not PLAN_YEAR_PATTERN.match(value):
+        raise ValueError("expected YYYY-YY, e.g. '2026-27'")
+    start, end = value.split("-")
+    if int(end) != (int(start) + 1) % 100:
+        raise ValueError("plan year must span consecutive years, e.g. '2026-27'")
+    return value
 
 
 def _http_detail(resp):
@@ -641,8 +658,8 @@ async def _get_request_readonly(session, request_id, user_id):
     return (await session.execute(stmt)).scalars().first()
 
 
-async def _persist_approval_per_item(session, request_id, user_id, plan_name, due_date_obj, all_items,
-                                     item_results, published_by):
+async def _persist_approval_per_item(session, request_id, user_id, plan_name, due_date_obj, plan_year,
+                                     all_items, item_results, published_by):
     """Persist the publish outcome. ONLY items whose iGOT create+publish both succeeded are written --
     a failed item gets NO mdo_approval row and stays PENDING, so it is naturally retried on the next run
     (no special-cased retry-handle placeholder needed). The request is flipped to APPROVED only when
@@ -658,7 +675,7 @@ async def _persist_approval_per_item(session, request_id, user_id, plan_name, du
             continue  # failed/not-attempted item: no DB write, stays PENDING for retry.
         session.add(MdoApproval(
             approval_request_id=request_id, approval_request_item_id=item.id,
-            plan_name=plan_name, due_date=due_dt,
+            plan_name=plan_name, due_date=due_dt, plan_year=plan_year,
             igot_cbp_plan_id=uuid.UUID(res["plan_id"]), created_at=now,
         ))
         await session.execute(update(ApprovalRequestItem).where(ApprovalRequestItem.id == item.id)
@@ -728,7 +745,7 @@ async def approve_and_publish(session, client, cfg, request_id, due_date_obj):
         await session.rollback()
         return "already_approved", [], plan_name
     await _persist_approval_per_item(session, request_id, cfg.user_id, plan_name, due_date_obj,
-                                     request.items, item_results, cfg.published_by)
+                                     cfg.plan_year, request.items, item_results, cfg.published_by)
     return "published", item_results, plan_name
 
 
@@ -1072,6 +1089,11 @@ async def main():
     except ValueError as e:
         sys.exit(f"Aborting: --due-date {args.due_date!r} is not a valid date: {e}")
 
+    try:
+        plan_year = validate_plan_year(args.plan_year)
+    except ValueError as e:
+        sys.exit(f"Aborting: --plan-year {args.plan_year!r} is not valid: {e}")
+
     rows = read_rows(args.excel)
     if not rows:
         sys.exit("Input file has no data rows.")
@@ -1084,7 +1106,7 @@ async def main():
     logger.info(f"Log file: {LOG_FILE}")
     logger.info(f"Loaded {len(rows)} row(s) from {args.excel}. Mode: {mode}. "
                 f"Batch size: {args.batch_size}. Retries: {args.max_retries}. published_by: {published_by}.")
-    logger.info(f"Publish defaults: due_date={default_due_date}, plan_year={args.plan_year} "
+    logger.info(f"Publish defaults: due_date={default_due_date}, plan_year={plan_year} "
                 f"(cbp_plan_name is built at request level from the request's own designation -- not "
                 f"read from the input row).")
 
@@ -1094,7 +1116,7 @@ async def main():
         user_token=user_token, published_by=published_by, approver_name=approver_name,
         user_id=args.user_id,
         default_due_date=default_due_date,
-        plan_year=args.plan_year,
+        plan_year=plan_year,
         max_retries=max(0, args.max_retries),
         backoff=max(0.0, args.retry_backoff),
         notify=enable_email_notification, notification_base=notification_base_url.rstrip("/"),

@@ -646,9 +646,11 @@ log at `bulk_scripts/logs/bulk_training_plan_approval_<timestamp>.log`.
 - The plan name is built as "AI CBP for `<designation>`" — it uses the iGOT designation name if one
   is set on the request's item, and only falls back to the plain designation name when there's no
   iGOT name.
-- The create call also sends `planYear` — a financial-year string (e.g. `"2026-27"`) passed as-is
-  from the mandatory `--plan-year` flag. It's independent of `due_date`/`--due-date` and applied to
-  every row in the run; there's no per-row `plan_year` column.
+- The create call also sends `planYear`, a financial-year string (e.g. `"2026-27"`) taken from the
+  mandatory `--plan-year` flag. The flag must be `YYYY-YY` with consecutive years, or the run aborts
+  at startup. It's independent of `due_date`/`--due-date`, applies to every row in the run, and is
+  saved to `mdo_approval.plan_year` for each published designation. There's no per-row `plan_year`
+  column in the input file.
 - Plan names longer than 70 characters are silently cut short — two long, similar designation names
   could end up looking identical in the published plan list.
 - Sending the "approved" notification email is best-effort, same as script 5 — a row can show
